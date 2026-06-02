@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI Course Compiler</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [["$", "$"], ["\\(", "\\)"]],
+          displayMath: [["$$", "$$"], ["\\[", "\\]"]],
+          processEscapes: true
+        },
+        options: {
+          skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"]
+        },
+        startup: {
+          typeset: false
+        }
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <h1>Courses</h1>
+      <div id="courseList" class="course-list"></div>
+    </aside>
+    <main class="reader">
+      <header class="toolbar">
+        <select id="versionSelect" aria-label="Version"></select>
+        <progress id="progress" value="0" max="100"></progress>
+      </header>
+      <nav id="lessonList" class="lesson-list"></nav>
+      <article id="lessonView" class="lesson-view"></article>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

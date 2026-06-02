@@ -1,0 +1,6 @@
+langgraph
+requests
+python-dotenv
+pypdf
+PyMuPDF
+mcp

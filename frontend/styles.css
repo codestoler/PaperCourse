@@ -1,0 +1,154 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  color: #202124;
+  background: #f7f8fa;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.sidebar {
+  border-right: 1px solid #d7dce2;
+  background: #ffffff;
+  padding: 20px;
+}
+
+h1 {
+  margin: 0 0 16px;
+  font-size: 22px;
+}
+
+button,
+select {
+  min-height: 36px;
+  border: 1px solid #c7ced8;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #202124;
+  font: inherit;
+}
+
+button {
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.active {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.course-list,
+.lesson-list {
+  display: grid;
+  gap: 8px;
+}
+
+.reader {
+  min-width: 0;
+  padding: 18px clamp(16px, 4vw, 48px);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+progress {
+  width: min(320px, 100%);
+  height: 12px;
+}
+
+.lesson-list {
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  margin-bottom: 18px;
+}
+
+.lesson-view {
+  max-width: 760px;
+  line-height: 1.65;
+  background: #ffffff;
+  border: 1px solid #d7dce2;
+  border-radius: 8px;
+  padding: 24px;
+}
+
+.lesson-view h1 {
+  font-size: 28px;
+}
+
+.lesson-view code {
+  background: #f0f2f5;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.lesson-view p {
+  margin: 0 0 14px;
+}
+
+.lesson-view ul {
+  margin: 0 0 14px 22px;
+  padding: 0;
+}
+
+.lesson-view li {
+  margin: 6px 0;
+}
+
+.check-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.source-line {
+  padding: 10px 12px;
+  border-left: 3px solid #2563eb;
+  background: #f7f9fc;
+}
+
+blockquote {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-left: 3px solid #8a96a8;
+  background: #f5f6f8;
+}
+
+.math-block {
+  overflow-x: auto;
+  margin: 12px 0 16px;
+  padding: 8px 0;
+}
+
+.mjx-container {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+@media (max-width: 760px) {
+  body {
+    display: block;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #d7dce2;
+  }
+
+  .toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
