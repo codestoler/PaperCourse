@@ -1,0 +1,4 @@
+interface:
+  display_name: "Frontend Browser Check"
+  short_description: "Browser smoke checks for this frontend."
+  default_prompt: "Use the frontend browser check skill to verify the current frontend flow."

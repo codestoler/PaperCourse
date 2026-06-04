@@ -23,17 +23,83 @@
     <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
   </head>
   <body>
-    <aside class="sidebar">
-      <h1>Courses</h1>
-      <div id="courseList" class="course-list"></div>
-    </aside>
-    <main class="reader">
-      <header class="toolbar">
-        <select id="versionSelect" aria-label="Version"></select>
-        <progress id="progress" value="0" max="100"></progress>
-      </header>
-      <nav id="lessonList" class="lesson-list"></nav>
-      <article id="lessonView" class="lesson-view"></article>
+    <main class="app-shell">
+      <section id="courseDashboard" class="course-dashboard">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">AI Course Compiler</p>
+            <h1>课程库</h1>
+          </div>
+          <button id="refreshCourses" class="secondary-action" type="button">刷新</button>
+        </header>
+        <section class="workspace-grid">
+          <section class="workspace-section">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">资料库</p>
+                <h2>上传与资料分析</h2>
+              </div>
+              <label class="file-picker">
+                <input id="libraryFileInput" type="file" multiple>
+                选择文件
+              </label>
+            </div>
+            <div id="uploadQueue" class="upload-queue"></div>
+            <div id="libraryFileList" class="resource-list"></div>
+          </section>
+
+          <section class="workspace-section">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">课程项目</p>
+                <h2>创建与编译要求</h2>
+              </div>
+            </div>
+            <form id="projectForm" class="project-form">
+              <input id="projectTitle" name="title" required placeholder="课程名">
+              <input id="projectSubject" name="subject" placeholder="学科方向">
+              <textarea id="projectDescription" name="description" rows="2" placeholder="课程描述"></textarea>
+              <select id="projectFiles" name="library_file_ids" multiple aria-label="资料库文件"></select>
+              <textarea id="projectRequirements" name="compile_requirements" rows="8" aria-label="课程编译要求"></textarea>
+              <button class="primary-action" type="submit">保存课程项目</button>
+            </form>
+            <div id="projectList" class="resource-list"></div>
+          </section>
+        </section>
+        <div id="courseList" class="course-grid"></div>
+        <section id="emptyState" class="empty-state" hidden>
+          <h2>还没有可学习的课程</h2>
+          <p>先上传资料并创建课程项目；完整课程编译会在分析与配置确认后执行。</p>
+        </section>
+      </section>
+
+      <section id="readerPanel" class="reader-panel" hidden>
+        <aside class="sidebar">
+          <button id="backToCourses" class="text-action" type="button">返回课程库</button>
+          <h1 id="readerTitle">Course</h1>
+          <div id="courseListCompact" class="course-list"></div>
+        </aside>
+        <main class="reader">
+          <header class="toolbar">
+            <select id="versionSelect" aria-label="Version"></select>
+            <progress id="progress" value="0" max="100"></progress>
+          </header>
+          <nav id="lessonList" class="lesson-list"></nav>
+          <article id="lessonView" class="lesson-view"></article>
+        </main>
+      </section>
+
+      <section id="managePanel" class="manage-panel" hidden>
+        <header class="page-header">
+          <div>
+            <button id="backFromManage" class="text-action" type="button">返回课程库</button>
+            <p class="eyebrow">课程管理</p>
+            <h1 id="manageTitle">Course</h1>
+          </div>
+          <button id="openManagedCourse" class="primary-action" type="button">打开学习</button>
+        </header>
+        <div id="manageContent" class="manage-content"></div>
+      </section>
     </main>
     <script src="/app.js"></script>
   </body>

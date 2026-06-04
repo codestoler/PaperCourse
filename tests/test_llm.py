@@ -68,6 +68,32 @@ class LLMClientTests(unittest.TestCase):
         self.assertIn(r"\theta", parsed["body_markdown"])
         self.assertIn(r"\frac", parsed["body_markdown"])
 
+    def test_complete_json_retries_bad_json(self) -> None:
+        class FakeResponse:
+            def __init__(self, body: str) -> None:
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self.body.encode("utf-8")
+
+        responses = [
+            FakeResponse('{"choices":[{"message":{"content":"not json"}}]}'),
+            FakeResponse('{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}'),
+        ]
+
+        with patch("agent_graph.llm.urlopen", side_effect=responses):
+            client = LLMClient("https://example.test/v1", "key", "model", retries=1, retry_backoff_seconds=0)
+            result = client.complete_json("system", "user")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.last_metadata["attempts"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

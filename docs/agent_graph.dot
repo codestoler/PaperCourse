@@ -1,0 +1,29 @@
+digraph compile_agent_graph {
+  rankdir=LR;
+  graph [fontname="Arial"];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=10];
+  edge [fontname="Arial", fontsize=9];
+  START [shape=oval, fillcolor="#eef2ff", color="#4f46e5"];
+  END [shape=oval, fillcolor="#f3f4f6", color="#374151"];
+  ingest_pipeline [label="Ingest Pipeline\\nLLM: optional_subpipeline\\nTools: filesystem, markdown_parser, mineru_metadata_reader, source_indexer, vision_subpipeline_optional, formula_vision_optional\\nDecision: deterministic_pipeline", shape=box, fillcolor="#ecfdf5", color="#047857"];
+  course_planning_loop [label="Course Planning Loop\\nLLM: optional\\nTools: llm_optional, local_fallback, source_index, source_brief, lesson_notes\\nDecision: llm_when_enabled_max_iterations", shape=box, fillcolor="#fef3c7", color="#b45309"];
+  compile_plan_gate [label="Compile Plan Gate\\nLLM: conditional\\nTools: filesystem, json_writer, markdown_writer, local_validator, llm_optional, local_repair\\nDecision: review_gate_max_revisions", shape=diamond, fillcolor="#fee2e2", color="#b91c1c"];
+  lesson_body_pipeline [label="Lesson Body Pipeline\\nLLM: optional\\nTools: filesystem, llm_optional, local_cache\\nDecision: per_lesson_pipeline", shape=box, fillcolor="#fef3c7", color="#b45309"];
+  validation_repair_loop [label="Validation & Repair Loop\\nLLM: conditional\\nTools: markdown_validator, local_validator, remark_lint_optional, llm_optional, local_repair\\nDecision: rules_first_max_iterations", shape=diamond, fillcolor="#fee2e2", color="#b91c1c"];
+  export_pipeline [label="Export Pipeline\\nLLM: no\\nTools: filesystem, markdown_writer, json_writer\\nDecision: deterministic_pipeline", shape=box, fillcolor="#ecfdf5", color="#047857"];
+  human_review [label="Human Review\\nLLM: no\\nTools: manual_review_queue\\nDecision: human_gate", shape=box, fillcolor="#f5f3ff", color="#7c3aed"];
+  START -> ingest_pipeline;
+  ingest_pipeline -> course_planning_loop [label="ingest artifacts ready"];
+  export_pipeline -> END [label="done"];
+  human_review -> END [label="blocked for manual review"];
+  course_planning_loop -> compile_plan_gate [label="planning ready; next_action != \"human_review\"", style="dashed", color="#b91c1c"];
+  course_planning_loop -> human_review [label="planning failed; next_action == \"human_review\"", style="dashed", color="#b91c1c"];
+  compile_plan_gate -> lesson_body_pipeline [label="review passed; compile plan review passed", style="dashed", color="#b91c1c"];
+  compile_plan_gate -> course_planning_loop [label="needs replanning; compile plan revision needs lesson replanning", style="dashed", color="#b91c1c"];
+  compile_plan_gate -> human_review [label="gate exhausted; next_action == \"human_review\"", style="dashed", color="#b91c1c"];
+  lesson_body_pipeline -> validation_repair_loop [label="lesson bodies ready; lesson body generation completed", style="dashed", color="#b91c1c"];
+  lesson_body_pipeline -> compile_plan_gate [label="needs finer split; lesson_body_revision_request.needs_finer_split", style="dashed", color="#b91c1c"];
+  lesson_body_pipeline -> human_review [label="body generation blocked; next_action == \"human_review\"", style="dashed", color="#b91c1c"];
+  validation_repair_loop -> export_pipeline [label="validated; validation_report.ok == true", style="dashed", color="#b91c1c"];
+  validation_repair_loop -> human_review [label="repair exhausted; next_action == \"human_review\"", style="dashed", color="#b91c1c"];
+}

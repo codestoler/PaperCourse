@@ -174,3 +174,93 @@
 - [x] 使用数值分析 ch6 smoke 验证：`numerical-analysis-ch6-hybrid-llm` `v15-enriched-smoke`，只刷新第 6 节 lesson body，28 lessons，`validate_course.py` 报 `status=ok`、`gap_high=0`。
 - [x] 抽查第 6 节“法方程的推导与几何意义”：生成偏导展开补全、充分性证明桥接和 Gram 矩阵下标易混辨析，均绑定到本节 source chunks。
 - [ ] PROBLEM: 真实 LLM 编译不能在 network-restricted sandbox 中运行；首次全量刷新因网络限制长时间无输出，已终止并改为外部执行的单节 smoke。后续应在 CLI 加入更明确的超时、进度输出和单节重试策略。
+
+## 阶段十八：MinerU 图片理解与课程落位
+
+- [x] 在 LangGraph compile loop 中新增 `understand_images` 节点，位于 `parse_sources` 后、source-index/brief/plan 前。
+- [x] 从 MinerU `full.md` 图片链接和 `*_content_list*.json` 中提取图片路径、bbox、page、type/sub_type、OCR/表格内容、caption/footnote。
+- [x] 生成结构化 `image_understanding.json/.md`，字段覆盖图片类型、关联知识点、摘要、建议插入 lesson/anchor、图注需求、置信度和 `needs_confirmation`。
+- [x] 采用轻量默认策略：不默认调用外部视觉模型，优先复用 MinerU 切图、位置和邻近文本；LVM 页级截图只作为视觉分析来源，不再作为待插入图片污染待确认区。
+- [x] 编译导出时将可识别图片写入对应 lesson 的 `## Figures`，无法可靠识别的图片只放到最后一节的 `## 待确认图片`。
+- [x] 前端 Markdown 渲染支持 `![alt](url)`、图注和图片样式；后端增加 `/api/assets/...` 安全读取 `course-vault` 图片资产。
+- [x] 版本记录新增 `versions/<version>/version_record.json`，保存图片理解统计和 artifact 位置。
+- [x] 新增中性 fixture 单元测试，覆盖可识别图片落位、未知图片待确认、asset URL 和 version record。
+- [x] 真实 ch6 smoke：`numerical-analysis-ch6-image-smoke` `v3-image-smoke`，37 lessons，图片统计 total=37、recognized=36、needs_confirmation=1，`validate_course.py` 报 `status=ok`、`gap_high=0`。
+- [x] 本地服务验证通过：课程 API 可读取 `v3-image-smoke`，lesson Markdown 包含图片，图片 asset 返回 `200 image/jpeg`。
+- [x] 新增可选真实视觉模型补强：`--use-vision-image-understanding`、`--image-vision-mode uncertain|all`、`--image-vision-max-images`、`--refresh-image-vision`。
+- [x] 将 per-image vision 结果缓存到 `course-vault/courses/<course_id>/image_vision_cache/`，同一图片重复编译可命中缓存，避免重复消耗 token。
+- [x] 使用真实 Z.AI MCP vision 路径验证 1 张待确认切图：`v5-image-vision-one`，vision analyzed=1，cache_misses=1，图片从待确认变为 recognized，`validate_course.py` 通过。
+- [x] 使用同配置重复编译验证缓存：`v7-image-vision-cache-clean`，cache_hits=1、cache_misses=0，37 images 全部 recognized，`validate_course.py` 通过。
+- [ ] PROBLEM: 真实 vision MCP 仍依赖外部服务和 `npx @z_ai/mcp-server` 启动，单图调用可能需要十几秒；当前已有 `--image-vision-max-images` 和缓存控制成本，后续还应补进程级超时与分批进度输出。
+
+## 阶段十九：Agent Graph 可视化
+
+- [x] 在 `agent_graph.compiler` 中新增 graph node/edge metadata，记录每个节点的 LLM 使用、工具依赖、决策来源、状态输出和转移条件。
+- [x] `build_compile_graph` 复用共享 edge metadata 注册线性边，降低真实拓扑和文档图漂移风险。
+- [x] 新增 `scripts/render_agent_graph.py`，生成 `docs/agent_graph.md`、`docs/agent_graph.mmd` 和 `docs/agent_graph.dot`。
+- [x] 图中区分 deterministic logic、optional LLM、external tool、conditional routing 和 human review gate，并标注 `next_action` 条件转移。
+- [x] `AGENTS.md` 增加约束：修改 `agent_graph/` 拓扑、路由或节点职责后必须运行 graph render 工具并提交更新后的图。
+- [x] `README.md` 增加完整工具说明和输出文件说明。
+- [x] 新增单元测试校验 graph metadata 覆盖所有 transition endpoint。
+- [x] 已运行 `.venv/bin/python scripts/render_agent_graph.py --render-svg`；本机缺少 Graphviz `dot`，因此 SVG 跳过，但 Markdown/Mermaid/DOT 已生成。
+- [x] 已运行 `.venv/bin/python -m unittest discover -s tests -v`，29 个测试全部通过。
+
+## 阶段二十：课程结构阶段 LLM-first
+
+- [x] 将 `extract_units` 改为支持 LLM-first 课程单元提取，LLM 输出经规则校验后写入 `units.json`，并保留 `source_file`、`page`、`block_id`、`bbox`、`source_order`。
+- [x] 将 `organize_logic` 改为支持 LLM-first 逻辑组织，输出语义/先修关系图；本地顺序边仅作为 emergency fallback 样例。
+- [x] 将 `detect_gaps` 改为支持 LLM-first 缺口检测，并用本地规则补充检测碎片章节、重复标题、图片说明/教师提示/页码/作者信息成章等错误。
+- [x] 将 `generate_lessons` 改为支持 LLM-first lesson 草案生成，规范化阶段强制从 unit 继承完整来源信息，过滤坏章节标题。
+- [x] 修改 LangGraph 路由：四个结构节点的 emergency fallback 都会进入 `human_review`，不会继续静默导出课程。
+- [x] CLI 增加 `--use-llm-structure`；脚本中 `--use-llm` 会默认启用结构阶段 LLM-first。
+- [x] Markdown Sources 行追加 provenance 摘要，JSON lesson/unit/source refs 也保留完整来源字段。
+- [x] 新增测试覆盖四个结构节点 LLM 调用、重复标题合并、图片说明/教师提示不成章、完整 provenance、LLM 不可用时进入 human review。
+- [x] 修改 agent graph 后已重新运行 `scripts/render_agent_graph.py --render-svg`，更新 `docs/agent_graph.md/.mmd/.dot`。
+- [x] 已运行 `.venv/bin/python -m unittest discover -s tests -v`，35 个测试全部通过。
+
+## 阶段二十一：Compile Plan 审核与修订 Gate
+
+- [x] 在 `generate_lessons` 和 `synthesize_lesson_bodies` 之间新增 `synthesize_compile_plan -> review_compile_plan_llm` gate，审核通过才允许进入正文生成。
+- [x] `synthesize_compile_plan` 输出 `compile_plan.json` 和 `compile_plan.md`，覆盖课程 ID、资料范围、章节层级、来源页码、来源 block、图片插入策略、预计 token、风险提示和人工确认项。
+- [x] `review_compile_plan_llm` 合并本地规则与可选 LLM 审核，检查粒度不均、短概念成章、重复标题、图片随机插入、视觉说明污染和公式混排风险。
+- [x] 审核失败时写入结构化 `revise_prompt`，路由到 `revise_compile_plan`，不得直接进入 `synthesize_lesson_bodies`。
+- [x] `revise_compile_plan` 写入 `compile_plan_revision_log.json`，每次修订后重新生成 plan 并回到审核；超过修订次数则进入 `human_review`。
+- [x] 新增单元测试覆盖正常放行、审核失败后修订并复审、修订次数耗尽后阻断正文生成。
+- [x] 已运行 `.venv/bin/python -m unittest discover -s tests -v`，38 个测试全部通过。
+
+## 阶段二十二：Grounding 与 Quality 双层 Validation
+
+- [x] 将旧 `check_grounding` / `check_quality` 拆分为 `check_grounding_llm`、`check_grounding_rules`、`check_quality_llm`、`check_quality_rules` 四个 graph 节点。
+- [x] `check_grounding_llm` 支持检查无来源推断、错误图注、错误公式解释；`--use-llm` 默认启用，也可通过 `--use-llm-validation` 显式启用。
+- [x] `check_grounding_rules` 检查 source page、block id、quote、image id、bbox 与 parsed/image artifacts 的可追溯性。
+- [x] `check_quality_llm` 支持检查课程讲解连贯性、章节结构合理性、视觉工具说明/页码注释污染。
+- [x] `check_quality_rules` 检查空章节、超短章节、重复标题、异常标题、公式破损、Markdown 列表与 matrix/cases/aligned 混排、代码块未闭合等确定性问题。
+- [x] `validation_report.json` 改为四层 `layers` 报告，失败项包含 lesson、block、line、source_page/image_id、bbox 和 reason。
+- [x] graph gate 改为四层检查全部通过才允许 `export_version`；任一失败进入 `repair_course`。
+- [x] 新增测试覆盖 provenance 定位、Markdown/公式/title 规则定位、LLM validation 失败阻断 export、LLM+rules 全通过后 export。
+- [x] 已运行 `.venv/bin/python -m unittest discover -s tests -v`，42 个测试全部通过。
+
+## 阶段二十三：课程选择与课程管理界面
+
+- [x] 清理 `course-vault/courses/` 中的历史测试课程，仅保留 `numerical-analysis`、`flash-user-guide`、`numerical-analysis-ch6-hybrid-llm`。
+- [x] 将课程选择页改为响应式卡片布局，桌面端多列、移动端单列。
+- [x] 课程卡片展示课程标题、简介、最近更新时间、学习进度、lesson 数、最新版本和编译状态。
+- [x] 增加课程库空状态提示，引导用户从 `course-vault/raw/` 上传/创建课程。
+- [x] 每张课程卡片提供“开始学习”和“管理”入口。
+- [x] 新增课程管理 API：课程基础信息、资料文件列表、版本列表、章节结构、内容条目和 validation 状态。
+- [x] 新增课程管理页，展示基本信息、资料文件、章节结构、最近编译时间和当前状态。
+- [x] 支持课程内容条目查看、重命名和删除；重命名会同步 Markdown H1、lesson 文件名和 `lessons.json` 标题。
+- [x] 本地服务验证通过：`/api/courses` 只返回 3 门课程，`/api/courses/numerical-analysis/manage` 返回 7 个资料文件、7 个章节分组、36 个内容条目。
+- [x] 已运行 `node -c frontend/app.js`、`.venv/bin/python -m py_compile backend/server.py`、`.venv/bin/python -m unittest discover -s tests -v`，43 个测试全部通过。
+- [ ] PROBLEM: Playwright/Chromium 截图验证因本机缺少 `libnspr4.so` 无法启动；需要安装浏览器系统依赖后才能做截图级 UI 回归。
+
+## 阶段二十四：统一 Source Evidence 与 Revision Tool
+
+- [x] 新增 `agent_graph/source_tools.py`，提供统一 `SourceLocator` 能力：`search`、`locate`、`get_context`、`find_images`、`verify_citations`、`verify_images`，覆盖文本、公式、表格、图片和邻近上下文。
+- [x] lesson provenance 增加稳定 `source_id`，导出 Markdown Sources 同步显示 `source_id`，避免依赖 LLM 自编页码。
+- [x] `generate_lessons` 和 `synthesize_lesson_bodies` 写入/携带 `lesson_evidence.json` 与 per-lesson evidence pack，使正文生成前具备显式 evidence。
+- [x] `check_grounding_rules` 改为基于 `SourceLocator` 的 citation/image verification，继续输出结构化 validation failure。
+- [x] `repair_course` 新增基于 `SourceLocator` evidence 的 citation/image provenance 修复，并通过 `SourceRevisionTool` 记录 patch 操作。
+- [x] 新增 `SourceRevisionTool`，支持 patch/diff 风格的 lesson 正文替换、lesson 拆分/合并、图片顺序调整、引用替换、补充 evidence、compile plan/state path patch、rollback 和 version compare。
+- [x] 新增 `tests/test_source_tools.py` 覆盖 source locator、citation verification、revision patch/rollback、split/merge/image/citation/evidence patch 和 version compare。
+- [x] 已运行 `.venv/bin/python -m unittest discover -s tests -v`，66 个测试全部通过。

@@ -5,5 +5,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 node_modules/
+.playwright-browsers/
 course-vault/courses
 course-vault/parsed
+user_feedback/

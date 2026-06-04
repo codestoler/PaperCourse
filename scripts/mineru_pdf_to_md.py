@@ -8,6 +8,7 @@ import json
 import os
 import time
 import zipfile
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,10 @@ def main() -> int:
     parser.add_argument("--model-version", default="vlm", choices=["pipeline", "vlm"])
     parser.add_argument("--poll-interval", type=int, default=20)
     parser.add_argument("--timeout", type=int, default=3600)
+    parser.add_argument("--request-timeout", type=int, default=60)
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--retry-backoff", type=float, default=2.0)
+    parser.add_argument("--progress-jsonl", default="")
     args = parser.parse_args()
 
     token = load_env_token("MINERU_TOKEN")
@@ -47,15 +52,15 @@ def main() -> int:
         return 0
 
     if not manifest.get("batch_id"):
-        manifest = submit_batch(token, pdfs, args.model_version)
+        manifest = submit_batch(token, pdfs, args.model_version, args.request_timeout, args.retries, args.retry_backoff)
         write_json(manifest_path, manifest)
 
     if not manifest.get("uploaded"):
-        upload_files(pdfs, manifest["file_urls"])
+        upload_files(pdfs, manifest["file_urls"], args.retries, args.retry_backoff)
         manifest["uploaded"] = True
         write_json(manifest_path, manifest)
 
-    results = poll_batch(token, manifest["batch_id"], args.timeout, args.poll_interval)
+    results = poll_batch(token, manifest["batch_id"], args.timeout, args.poll_interval, manifest_path, args.progress_jsonl, args.request_timeout, args.retries, args.retry_backoff)
     manifest["results"] = results
     write_json(manifest_path, manifest)
 
@@ -66,7 +71,7 @@ def main() -> int:
             print(f"- {item.get('file_name')}: {item.get('err_msg')}")
         return 3
 
-    download_results(results, output_dir)
+    download_results(results, output_dir, args.retries, args.retry_backoff)
     missing = [pdf.name for pdf in pdfs if not parsed_markdown_path(output_dir, pdf.stem).exists()]
     if missing:
         print(f"PROBLEM: MinerU completed but Markdown extraction is missing for: {missing}")
@@ -98,10 +103,13 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def submit_batch(token: str, pdfs: list[Path], model_version: str) -> dict[str, Any]:
+def submit_batch(token: str, pdfs: list[Path], model_version: str, request_timeout: int, retries: int, retry_backoff: float) -> dict[str, Any]:
     files = [{"name": pdf.name, "data_id": safe_data_id(pdf.stem)} for pdf in pdfs]
-    response = requests.post(
+    response = request_with_retry(
+        "post",
         f"{MINERU_API}/file-urls/batch",
+        retries=retries,
+        retry_backoff=retry_backoff,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={
             "files": files,
@@ -110,7 +118,7 @@ def submit_batch(token: str, pdfs: list[Path], model_version: str) -> dict[str, 
             "enable_formula": True,
             "enable_table": True,
         },
-        timeout=60,
+        timeout=request_timeout,
     )
     payload = response.json()
     if response.status_code != 200 or payload.get("code") != 0:
@@ -123,25 +131,37 @@ def submit_batch(token: str, pdfs: list[Path], model_version: str) -> dict[str, 
     }
 
 
-def upload_files(pdfs: list[Path], urls: list[str]) -> None:
+def upload_files(pdfs: list[Path], urls: list[str], retries: int, retry_backoff: float) -> None:
     if len(pdfs) != len(urls):
         raise RuntimeError("MinerU returned a different number of upload URLs than input files")
     for pdf, url in zip(pdfs, urls):
-        with pdf.open("rb") as handle:
-            response = requests.put(url, data=handle, timeout=180)
+        response = request_with_retry("put", url, retries=retries, retry_backoff=retry_backoff, data=pdf.read_bytes(), timeout=180)
         if response.status_code not in {200, 204}:
             raise RuntimeError(f"Upload failed for {pdf.name}: http={response.status_code}")
         print(f"uploaded={pdf.name}")
 
 
-def poll_batch(token: str, batch_id: str, timeout: int, interval: int) -> list[dict[str, Any]]:
+def poll_batch(
+    token: str,
+    batch_id: str,
+    timeout: int,
+    interval: int,
+    manifest_path: Path,
+    progress_jsonl: str,
+    request_timeout: int,
+    retries: int,
+    retry_backoff: float,
+) -> list[dict[str, Any]]:
     deadline = time.time() + timeout
     last_states = ""
     while time.time() < deadline:
-        response = requests.get(
+        response = request_with_retry(
+            "get",
             f"{MINERU_API}/extract-results/batch/{batch_id}",
+            retries=retries,
+            retry_backoff=retry_backoff,
             headers={"Authorization": f"Bearer {token}", "Accept": "*/*"},
-            timeout=60,
+            timeout=request_timeout,
         )
         payload = response.json()
         if response.status_code != 200 or payload.get("code") != 0:
@@ -150,14 +170,30 @@ def poll_batch(token: str, batch_id: str, timeout: int, interval: int) -> list[d
         states = ", ".join(f"{item.get('file_name')}={item.get('state')}" for item in results)
         if states != last_states:
             print(states)
+            progress = {
+                "timestamp": utc_now_iso(),
+                "stage": "mineru_poll",
+                "status": "running",
+                "batch_id": batch_id,
+                "states": [{key: item.get(key) for key in ("file_name", "state", "err_msg")} for item in results],
+            }
+            append_jsonl(progress_jsonl, progress)
+            manifest = read_manifest(manifest_path)
+            manifest["last_progress"] = progress
+            write_json(manifest_path, manifest)
             last_states = states
         if results and all(item.get("state") in {"done", "failed"} for item in results):
             return results
         time.sleep(interval)
-    raise TimeoutError(f"MinerU polling timed out for batch_id={batch_id}")
+    progress = {"timestamp": utc_now_iso(), "stage": "mineru_poll", "status": "timeout", "batch_id": batch_id}
+    append_jsonl(progress_jsonl, progress)
+    manifest = read_manifest(manifest_path)
+    manifest["last_progress"] = progress
+    write_json(manifest_path, manifest)
+    raise TimeoutError(f"MinerU polling timed out for batch_id={batch_id}; rerun the same command to resume from mineru_manifest.json")
 
 
-def download_results(results: list[dict[str, Any]], output_dir: Path) -> None:
+def download_results(results: list[dict[str, Any]], output_dir: Path, retries: int, retry_backoff: float) -> None:
     zip_dir = output_dir / "_zip"
     zip_dir.mkdir(parents=True, exist_ok=True)
     for item in results:
@@ -176,7 +212,7 @@ def download_results(results: list[dict[str, Any]], output_dir: Path) -> None:
         if zip_path.exists():
             content = zip_path.read_bytes()
         else:
-            response = requests.get(url, timeout=180)
+            response = request_with_retry("get", url, retries=retries, retry_backoff=retry_backoff, timeout=180)
             response.raise_for_status()
             content = response.content
             zip_path.write_bytes(content)
@@ -212,6 +248,34 @@ def redact(payload: Any) -> Any:
     if len(text) > 800:
         text = text[:800] + "..."
     return text
+
+
+def request_with_retry(method: str, url: str, *, retries: int, retry_backoff: float, **kwargs: Any) -> requests.Response:
+    attempts = max(0, retries) + 1
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.request(method.upper(), url, **kwargs)
+            if response.status_code not in {408, 425, 429} and response.status_code < 500:
+                return response
+            last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+        except requests.RequestException as exc:
+            last_error = exc
+        if attempt < attempts:
+            time.sleep(max(0.0, retry_backoff) * attempt)
+    raise RuntimeError(f"request failed after {attempts} attempt(s): {last_error}")
+
+
+def append_jsonl(path: str, payload: dict[str, Any]) -> None:
+    if not path:
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.open("a", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 if __name__ == "__main__":

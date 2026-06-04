@@ -25,16 +25,27 @@ class CourseCompileState(TypedDict):
     concepts: list[dict[str, Any]]
     lessons: list[dict[str, Any]]
     lesson_bodies: dict[str, Any]
+    lesson_body_inputs: dict[str, Any]
+    lesson_body_revision_request: dict[str, Any]
+    markdown_syntax_report: dict[str, Any]
+    markdown_repair_audit: dict[str, Any]
+    compile_plan: dict[str, Any]
+    compile_plan_review: dict[str, Any]
+    compile_plan_revisions: list[dict[str, Any]]
+    image_understanding: dict[str, Any]
     source_index: dict[str, Any]
+    lesson_evidence: dict[str, Any]
     source_brief: dict[str, Any]
     lesson_notes: dict[str, Any]
     course_plan: dict[str, Any]
     compile_profile: dict[str, Any]
     compile_patches: list[dict[str, Any]]
+    repair_report: dict[str, Any]
     validation_report: dict[str, Any]
     next_action: str
     errors: list[dict[str, Any]]
     graph_run_log: list[dict[str, Any]]
+    internal_run_log: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -71,14 +82,25 @@ def initial_state(config: CompileConfig) -> CourseCompileState:
         "concepts": [],
         "lessons": [],
         "lesson_bodies": {},
+        "lesson_body_inputs": {},
+        "lesson_body_revision_request": {},
+        "markdown_syntax_report": {},
+        "markdown_repair_audit": {},
+        "compile_plan": {},
+        "compile_plan_review": {},
+        "compile_plan_revisions": [],
+        "image_understanding": {},
         "source_index": {},
+        "lesson_evidence": {},
         "source_brief": {},
         "lesson_notes": {},
         "course_plan": {},
         "compile_profile": dict(config.profile),
         "compile_patches": [],
+        "repair_report": {},
         "validation_report": {},
         "next_action": "parse_sources",
         "errors": [],
         "graph_run_log": [],
+        "internal_run_log": [],
     }

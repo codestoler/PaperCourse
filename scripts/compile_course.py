@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,7 @@ def main() -> int:
         help="Course organization style; learn-by-doing turns software manuals into task-first tutorials",
     )
     parser.add_argument("--use-llm", action="store_true", help="Use the configured LLM to plan course hierarchy")
+    parser.add_argument("--use-llm-structure", action="store_true", help="Use LLM-first unit extraction, logic organization, gap detection, and lesson drafting")
     parser.add_argument("--use-source-index", action="store_true", help="Build batched source context packs before planning")
     parser.add_argument("--use-llm-source-index", action="store_true", help="Use the configured LLM to build source context packs")
     parser.add_argument("--use-source-brief", action="store_true", help="Build a source teaching brief before planning")
@@ -35,6 +37,12 @@ def main() -> int:
     parser.add_argument("--use-lesson-notes", action="store_true", help="Build per-lesson teaching notes after planning")
     parser.add_argument("--use-llm-lesson-notes", action="store_true", help="Use the configured LLM for per-lesson teaching notes")
     parser.add_argument("--use-llm-lesson-bodies", action="store_true", help="Use the configured LLM to write full per-lesson study bodies")
+    parser.add_argument("--use-llm-validation", action="store_true", help="Use the configured LLM for grounding and quality validation gates")
+    parser.add_argument("--use-vision-image-understanding", action="store_true", help="Use the configured vision MCP server to refine selected image records")
+    parser.add_argument("--use-formula-image-recognition", action="store_true", help="Use the configured vision MCP server to convert formula images into editable Markdown/LaTeX")
+    parser.add_argument("--image-vision-mode", default="uncertain", choices=["uncertain", "all"], help="Which images should be sent to the vision model")
+    parser.add_argument("--image-vision-max-images", type=int, default=12, help="Maximum image crops sent to the vision model in one compile")
+    parser.add_argument("--formula-image-max-images", type=int, default=12, help="Maximum formula image crops sent to the formula recognition agent in one compile")
     parser.add_argument("--detailed-lessons", action="store_true", help="Export fuller study notes instead of compact lesson summaries")
     parser.add_argument("--max-llm-chunks", type=int, default=90, help="Maximum parsed chunks sent to the LLM planner")
     parser.add_argument("--source-brief-index-chars", type=int, default=18000)
@@ -58,7 +66,20 @@ def main() -> int:
     parser.add_argument("--refresh-llm-plan", action="store_true", help="Ignore the local LLM plan cache and call the provider")
     parser.add_argument("--refresh-lesson-notes", action="store_true", help="Ignore the local lesson-note cache")
     parser.add_argument("--refresh-lesson-bodies", action="store_true", help="Ignore the local lesson-body cache")
+    parser.add_argument("--refresh-image-vision", action="store_true", help="Ignore cached per-image vision analysis")
+    parser.add_argument("--refresh-formula-image-recognition", action="store_true", help="Ignore cached per-formula image recognition")
+    parser.add_argument("--progress-jsonl", default="", help="Optional JSONL file that receives compile progress events")
+    parser.add_argument("--llm-timeout", type=int, default=0, help="Override LLM request timeout in seconds")
+    parser.add_argument("--llm-retries", type=int, default=-1, help="Override LLM retry count for transient failures")
+    parser.add_argument("--llm-retry-backoff", type=float, default=-1.0, help="Override LLM retry backoff base in seconds")
     args = parser.parse_args()
+
+    if args.llm_timeout > 0:
+        os.environ["LLM_TIMEOUT"] = str(args.llm_timeout)
+    if args.llm_retries >= 0:
+        os.environ["LLM_RETRIES"] = str(args.llm_retries)
+    if args.llm_retry_backoff >= 0:
+        os.environ["LLM_RETRY_BACKOFF_SECONDS"] = str(args.llm_retry_backoff)
 
     profile = {
         "use_source_index": args.use_source_index,
@@ -69,7 +90,14 @@ def main() -> int:
         "use_lesson_notes": args.use_lesson_notes,
         "use_llm_lesson_notes": args.use_llm_lesson_notes,
         "use_llm_lesson_bodies": args.use_llm_lesson_bodies,
+        "use_llm_validation": args.use_llm_validation,
+        "use_vision_image_understanding": args.use_vision_image_understanding,
+        "use_formula_image_recognition": args.use_formula_image_recognition,
+        "image_vision_mode": args.image_vision_mode,
+        "image_vision_max_images": args.image_vision_max_images,
+        "formula_image_max_images": args.formula_image_max_images,
         "use_llm": args.use_llm,
+        "use_llm_structure": args.use_llm_structure or args.use_llm,
         "detailed_lessons": args.detailed_lessons,
         "max_llm_chunks": args.max_llm_chunks,
         "source_brief_index_chars": args.source_brief_index_chars,
@@ -88,6 +116,9 @@ def main() -> int:
         "refresh_llm_plan": args.refresh_llm_plan,
         "refresh_lesson_notes": args.refresh_lesson_notes,
         "refresh_lesson_bodies": args.refresh_lesson_bodies,
+        "refresh_image_vision": args.refresh_image_vision,
+        "refresh_formula_image_recognition": args.refresh_formula_image_recognition,
+        "progress_jsonl": args.progress_jsonl,
         "course_style": args.course_style,
     }
     state = compile_course(args.sources, args.course_id, args.vault_root, args.version, profile=profile)

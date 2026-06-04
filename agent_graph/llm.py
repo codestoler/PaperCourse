@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -27,6 +28,8 @@ def load_env(path: str | Path = ".env") -> dict[str, str]:
         "LLM_ALLOW_GENERIC_FALLBACK",
         "LLM_ALLOW_SILICONFLOW_FALLBACK",
         "LLM_TIMEOUT",
+        "LLM_RETRIES",
+        "LLM_RETRY_BACKOFF_SECONDS",
         "GLM_ANTHROPIC_URL",
         "GLM_BASE_URL",
         "GLM_API_KEY",
@@ -43,27 +46,40 @@ def load_env(path: str | Path = ".env") -> dict[str, str]:
 class LLMClient:
     """Small JSON-completion client with GLM-first provider selection."""
 
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 120, provider: str = "openai") -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: int = 120,
+        provider: str = "openai",
+        retries: int = 2,
+        retry_backoff_seconds: float = 2.0,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self.provider = provider
+        self.retries = max(0, retries)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
         self.last_metadata: dict[str, Any] = {}
 
     @classmethod
     def from_env(cls) -> "LLMClient | None":
         values = load_env()
         timeout = int(values.get("LLM_TIMEOUT", "300"))
+        retries = int(values.get("LLM_RETRIES", "2"))
+        retry_backoff_seconds = float(values.get("LLM_RETRY_BACKOFF_SECONDS", "2"))
         glm_key = values.get("GLM_API_KEY") or values.get("ANTHROPIC_AUTH_TOKEN")
         glm_model = values.get("GLM_MODEL") or values.get("LLM_MODEL") or "GLM-4.7"
         anthropic_url = values.get("GLM_ANTHROPIC_URL") or values.get("ANTHROPIC_BASE_URL")
         if anthropic_url and glm_key:
-            return cls(anthropic_url, glm_key, glm_model, timeout=timeout, provider="anthropic")
+            return cls(anthropic_url, glm_key, glm_model, timeout=timeout, provider="anthropic", retries=retries, retry_backoff_seconds=retry_backoff_seconds)
 
         glm_base_url = values.get("GLM_BASE_URL")
         if glm_base_url and glm_key and glm_model:
-            return cls(glm_base_url, glm_key, glm_model, timeout=timeout, provider="openai")
+            return cls(glm_base_url, glm_key, glm_model, timeout=timeout, provider="openai", retries=retries, retry_backoff_seconds=retry_backoff_seconds)
 
         llm_base_url = values.get("LLM_BASE_URL", "")
         llm_key = values.get("LLM_API_KEY")
@@ -72,7 +88,7 @@ class LLMClient:
         allow_siliconflow = values.get("LLM_ALLOW_SILICONFLOW_FALLBACK") == "1"
         if llm_base_url and llm_key and llm_model and allow_generic:
             if "siliconflow.cn" not in llm_base_url or allow_siliconflow:
-                return cls(llm_base_url, llm_key, llm_model, timeout=timeout, provider="openai")
+                return cls(llm_base_url, llm_key, llm_model, timeout=timeout, provider="openai", retries=retries, retry_backoff_seconds=retry_backoff_seconds)
         return None
 
     @property
@@ -80,6 +96,37 @@ class LLMClient:
         return {"provider": self.provider, "base_url": self.base_url, "model": self.model}
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
+        errors: list[str] = []
+        attempts = self.retries + 1
+        for attempt in range(1, attempts + 1):
+            started = time.monotonic()
+            try:
+                result = self._complete_json_once(system, user)
+                self.last_metadata = {
+                    **self.last_metadata,
+                    "attempt": attempt,
+                    "attempts": attempt,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "timeout_seconds": self.timeout,
+                }
+                return result
+            except Exception as exc:
+                errors.append(str(exc))
+                self.last_metadata = {
+                    "provider": self.provider,
+                    "model": self.model,
+                    "attempt": attempt,
+                    "attempts": attempt,
+                    "timeout_seconds": self.timeout,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "error": str(exc),
+                }
+                if attempt >= attempts:
+                    break
+                time.sleep(self.retry_backoff_seconds * attempt)
+        raise RuntimeError(f"LLM request failed after {attempts} attempt(s): {errors[-1] if errors else 'unknown error'}")
+
+    def _complete_json_once(self, system: str, user: str) -> dict[str, Any]:
         if self.provider == "anthropic":
             return self._complete_json_anthropic(system, user)
         try:
