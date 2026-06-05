@@ -60,6 +60,11 @@
               <input id="projectSubject" name="subject" placeholder="学科方向">
               <textarea id="projectDescription" name="description" rows="2" placeholder="课程描述"></textarea>
               <select id="projectFiles" name="library_file_ids" multiple aria-label="资料库文件"></select>
+              <div id="projectSelectedFiles" class="selected-source-list"></div>
+              <label class="file-picker project-upload-picker">
+                <input id="projectUploadInput" type="file" multiple>
+                继续上传资料
+              </label>
               <textarea id="projectRequirements" name="compile_requirements" rows="8" aria-label="课程编译要求"></textarea>
               <button class="primary-action" type="submit">保存课程项目</button>
             </form>

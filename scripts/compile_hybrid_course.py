@@ -69,12 +69,15 @@ def main() -> int:
     parser.add_argument("--refresh-formula-image-recognition", action="store_true")
     parser.add_argument("--progress-jsonl", default="", help="Optional JSONL file that receives compile progress events")
     parser.add_argument("--llm-timeout", type=int, default=0, help="Override LLM request timeout in seconds")
+    parser.add_argument("--llm-connect-timeout", type=int, default=0, help="Override LLM TCP connect timeout in seconds")
     parser.add_argument("--llm-retries", type=int, default=-1, help="Override LLM retry count for transient failures")
     parser.add_argument("--llm-retry-backoff", type=float, default=-1.0, help="Override LLM retry backoff base in seconds")
     args = parser.parse_args()
 
     if args.llm_timeout > 0:
         os.environ["LLM_TIMEOUT"] = str(args.llm_timeout)
+    if args.llm_connect_timeout > 0:
+        os.environ["LLM_CONNECT_TIMEOUT"] = str(args.llm_connect_timeout)
     if args.llm_retries >= 0:
         os.environ["LLM_RETRIES"] = str(args.llm_retries)
     if args.llm_retry_backoff >= 0:

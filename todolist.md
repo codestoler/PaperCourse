@@ -217,6 +217,8 @@
 - [x] 新增测试覆盖四个结构节点 LLM 调用、重复标题合并、图片说明/教师提示不成章、完整 provenance、LLM 不可用时进入 human review。
 - [x] 修改 agent graph 后已重新运行 `scripts/render_agent_graph.py --render-svg`，更新 `docs/agent_graph.md/.mmd/.dot`。
 - [x] 已运行 `.venv/bin/python -m unittest discover -s tests -v`，35 个测试全部通过。
+- [ ] PROBLEM: 2026-06-04 数值分析全量编译 `v19-glm-mcp-full-20260604214902` 在 `extract_units` 进入 human review；GLM-5.1 结构抽取三次尝试后返回非法 JSON（`Unterminated string starting at line 441 column 18`），已生成 `extract_units_emergency_fallback.json`，但 LLM-first 结构 gate 要求人工审阅。后续需要降低结构抽取上下文、分批抽取 units，或增加严格 JSON 修复/重试策略。
+- [ ] PROBLEM: 2026-06-05 数值分析全量编译正文阶段多次遇到 GLM 端点间歇性连接不可达；`synthesize_lesson_bodies` 曾在 lesson-001 三次请求后报 `<urlopen error [Errno 110] Connection timed out>`，后续检查时编译进程到 `open.bigmodel.cn:443` 处于 `SYN-SENT`，同时 `curl --connect-timeout 10 https://open.bigmodel.cn/api/anthropic` 连接超时。已确认 prompt 预检按 15000 字限制执行，且端点在其他时段可返回 HTTP 200，因此这是外部网络/代理链路不稳定，需要网络恢复后从 cache 断点续跑。
 
 ## 阶段二十一：Compile Plan 审核与修订 Gate
 
@@ -264,3 +266,4 @@
 - [x] 新增 `SourceRevisionTool`，支持 patch/diff 风格的 lesson 正文替换、lesson 拆分/合并、图片顺序调整、引用替换、补充 evidence、compile plan/state path patch、rollback 和 version compare。
 - [x] 新增 `tests/test_source_tools.py` 覆盖 source locator、citation verification、revision patch/rollback、split/merge/image/citation/evidence patch 和 version compare。
 - [x] 已运行 `.venv/bin/python -m unittest discover -s tests -v`，66 个测试全部通过。
+- [ ] PROBLEM: 2026-06-05 数值分析全量编译期间，GLM HTTPS 连接间歇停在 `SYN-SENT`，Python `urllib`/`requests` 没能按预期及时结束连接等待；已将 LLM POST 改为优先走 `curl --connect-timeout <LLM_CONNECT_TIMEOUT> --max-time <LLM_TIMEOUT>`，并继续用 lesson body 缓存断点续跑。

@@ -9,3 +9,4 @@ node_modules/
 course-vault/courses
 course-vault/parsed
 user_feedback/
+logs/

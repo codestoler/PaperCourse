@@ -160,6 +160,23 @@ class FrontendRendererTests(unittest.TestCase):
         self.assertEqual(data["parsed"]["custom_rule"], "只使用资料库证据。")
         self.assertIn("course_structure", data["parsed"])
 
+    def test_project_status_labels_cover_compile_flow(self) -> None:
+        data = self.run_node_json(
+            """
+            const { projectStatusLabel } = require('./frontend/app.js');
+            const states = ['not_started', 'queued', 'analyzing', 'awaiting_confirmation', 'compiling', 'succeeded', 'failed'];
+            process.stdout.write(JSON.stringify(Object.fromEntries(states.map((state) => [state, projectStatusLabel(state)]))));
+            """
+        )
+
+        self.assertEqual(data["not_started"], "未开始")
+        self.assertEqual(data["queued"], "排队中")
+        self.assertEqual(data["analyzing"], "分析中")
+        self.assertEqual(data["awaiting_confirmation"], "待确认")
+        self.assertEqual(data["compiling"], "编译中")
+        self.assertEqual(data["succeeded"], "成功")
+        self.assertEqual(data["failed"], "失败")
+
 
 if __name__ == "__main__":
     unittest.main()

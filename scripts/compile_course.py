@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -69,13 +70,17 @@ def main() -> int:
     parser.add_argument("--refresh-image-vision", action="store_true", help="Ignore cached per-image vision analysis")
     parser.add_argument("--refresh-formula-image-recognition", action="store_true", help="Ignore cached per-formula image recognition")
     parser.add_argument("--progress-jsonl", default="", help="Optional JSONL file that receives compile progress events")
+    parser.add_argument("--compile-context", default="", help="Confirmed project compile context JSON produced by the local backend")
     parser.add_argument("--llm-timeout", type=int, default=0, help="Override LLM request timeout in seconds")
+    parser.add_argument("--llm-connect-timeout", type=int, default=0, help="Override LLM TCP connect timeout in seconds")
     parser.add_argument("--llm-retries", type=int, default=-1, help="Override LLM retry count for transient failures")
     parser.add_argument("--llm-retry-backoff", type=float, default=-1.0, help="Override LLM retry backoff base in seconds")
     args = parser.parse_args()
 
     if args.llm_timeout > 0:
         os.environ["LLM_TIMEOUT"] = str(args.llm_timeout)
+    if args.llm_connect_timeout > 0:
+        os.environ["LLM_CONNECT_TIMEOUT"] = str(args.llm_connect_timeout)
     if args.llm_retries >= 0:
         os.environ["LLM_RETRIES"] = str(args.llm_retries)
     if args.llm_retry_backoff >= 0:
@@ -121,6 +126,21 @@ def main() -> int:
         "progress_jsonl": args.progress_jsonl,
         "course_style": args.course_style,
     }
+    if args.compile_context:
+        context_path = Path(args.compile_context)
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+        snapshot = context.get("confirmed_compile_snapshot", {}) if isinstance(context, dict) else {}
+        scheme = snapshot.get("selected_scheme", {}) if isinstance(snapshot, dict) else {}
+        overrides = scheme.get("compile_profile_overrides", {}) if isinstance(scheme, dict) else {}
+        for key, value in overrides.items():
+            if key in profile and value not in (None, ""):
+                profile[key] = value
+        profile["project_compile_context_path"] = str(context_path)
+        profile["confirmed_library_file_ids"] = list(snapshot.get("library_file_ids", [])) if isinstance(snapshot, dict) else []
+        profile["user_compile_requirements"] = dict(snapshot.get("compile_requirements", {})) if isinstance(snapshot, dict) else {}
+        profile["selected_compile_scheme"] = scheme
+        profile["confirmed_preflight_plan_id"] = str(snapshot.get("plan_id", "")) if isinstance(snapshot, dict) else ""
+        profile["confirmed_preflight_plan_signature"] = str(snapshot.get("plan_signature", "")) if isinstance(snapshot, dict) else ""
     state = compile_course(args.sources, args.course_id, args.vault_root, args.version, profile=profile)
     course_path = Path(args.vault_root) / "courses" / args.course_id
     print(f"status={state['next_action']}")

@@ -996,7 +996,7 @@ def _math_markdown_diagnostics(markdown: str) -> list[dict[str, Any]]:
         )
     in_display = False
     for index, line in enumerate(lines, start=1):
-        if "$$" in line:
+        if line.count("$$") % 2:
             in_display = not in_display
             continue
         if in_display and re.match(r"^\s*[-+*]\s+", line):
@@ -2953,6 +2953,21 @@ def _use_llm_structure(state: CourseCompileState) -> bool:
     return bool(profile.get("use_llm_structure", profile.get("use_llm", False)))
 
 
+DEFAULT_LLM_PROMPT_CHAR_LIMIT = 15000
+
+
+def _llm_prompt_char_limit(state: CourseCompileState | None = None) -> int:
+    profile = state.get("compile_profile", {}) if state else {}
+    try:
+        return max(1000, int(profile.get("llm_prompt_char_limit", DEFAULT_LLM_PROMPT_CHAR_LIMIT)))
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_PROMPT_CHAR_LIMIT
+
+
+def _prompt_char_count(system: str, user: str) -> int:
+    return len(system) + len(user)
+
+
 def _structure_cache_path(course_path: Path, client: Any, name: str, system: str, user: str) -> Path | None:
     cache_key = getattr(client, "cache_key", None)
     if not callable(cache_key):
@@ -2968,11 +2983,21 @@ def _complete_structure_json(
     user: str,
     payload_key: str,
     refresh: bool = False,
+    prompt_char_limit: int = DEFAULT_LLM_PROMPT_CHAR_LIMIT,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     cache_path = _structure_cache_path(course_path, client, cache_name, system, user)
+    prompt_chars = _prompt_char_count(system, user)
     if cache_path and cache_path.exists() and not refresh:
         cached = read_json(cache_path)
-        return cached.get(payload_key, cached), {"local_cache": "hit", "cache_path": str(cache_path), "metadata": cached.get("metadata", {})}
+        return cached.get(payload_key, cached), {
+            "local_cache": "hit",
+            "cache_path": str(cache_path),
+            "prompt_chars": prompt_chars,
+            "prompt_char_limit": prompt_char_limit,
+            "metadata": cached.get("metadata", {}),
+        }
+    if prompt_chars > prompt_char_limit:
+        raise ValueError(f"LLM prompt too long before submit: {prompt_chars} chars > limit {prompt_char_limit}; split required")
     raw = client.complete_json(system, user)
     metadata = getattr(client, "last_metadata", {})
     if cache_path:
@@ -2984,7 +3009,13 @@ def _complete_structure_json(
                 "metadata": metadata,
             },
         )
-    return raw, {"local_cache": "miss", "cache_path": str(cache_path) if cache_path else "", "metadata": metadata}
+    return raw, {
+        "local_cache": "miss",
+        "cache_path": str(cache_path) if cache_path else "",
+        "prompt_chars": prompt_chars,
+        "prompt_char_limit": prompt_char_limit,
+        "metadata": metadata,
+    }
 
 
 def _emergency_structure_fallback(
@@ -3066,6 +3097,83 @@ def _chunks_for_structure_prompt(chunks: list[dict[str, Any]], max_chunks: int, 
     if len(chunks) > len(selected):
         lines.append(f"- omitted_chunks: {len(chunks) - len(selected)}")
     return "\n".join(lines)
+
+
+def _compact_unit_for_prompt(unit: dict[str, Any], summary_chars: int = 320) -> dict[str, Any]:
+    return {
+        "id": unit.get("id", ""),
+        "title": unit.get("title", ""),
+        "section_title": unit.get("section_title", ""),
+        "lesson_type": unit.get("lesson_type", ""),
+        "content_type": unit.get("content_type", ""),
+        "summary": _short_text(str(unit.get("summary", "")), summary_chars),
+        "source_chunk_ids": list(unit.get("source_chunk_ids", [])),
+    }
+
+
+def _compact_units_for_prompt(units: list[dict[str, Any]], max_chars: int = 10000, summary_chars: int = 320) -> str:
+    compact: list[dict[str, Any]] = []
+    for unit in units:
+        compact.append(_compact_unit_for_prompt(unit, summary_chars=summary_chars))
+        serialized = json.dumps(compact, ensure_ascii=False)
+        if len(serialized) > max_chars:
+            compact.pop()
+            break
+    omitted = max(0, len(units) - len(compact))
+    payload: dict[str, Any] = {"units": compact}
+    if omitted:
+        payload["omitted_units"] = omitted
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _compact_logic_graph_for_prompt(logic_graph: dict[str, Any], max_chars: int = 3600) -> str:
+    payload = {
+        "nodes": [
+            {
+                "id": node.get("id", ""),
+                "title": node.get("title", ""),
+                "role": node.get("role", ""),
+            }
+            for node in logic_graph.get("nodes", [])
+        ],
+        "edges": [
+            {
+                "from": edge.get("from", ""),
+                "to": edge.get("to", ""),
+                "relation": edge.get("relation", ""),
+                "reason": _short_text(str(edge.get("reason", "")), 160),
+            }
+            for edge in logic_graph.get("edges", [])
+        ],
+    }
+    return _short_text(json.dumps(payload, ensure_ascii=False), max_chars)
+
+
+def _compact_gap_report_for_prompt(gap_report: dict[str, Any], max_chars: int = 4200) -> str:
+    payload = {
+        "ok": gap_report.get("ok", False),
+        "summary": gap_report.get("summary", {}),
+        "items": [
+            {
+                "unit_id": item.get("unit_id", ""),
+                "type": item.get("type", ""),
+                "severity": item.get("severity", ""),
+                "message": _short_text(str(item.get("message", "")), 180),
+                "source_chunk_ids": list(item.get("source_chunk_ids", []))[:8],
+            }
+            for item in gap_report.get("items", [])
+        ],
+    }
+    return _short_text(json.dumps(payload, ensure_ascii=False), max_chars)
+
+
+def _fallback_unit_candidate_for_prompt(unit: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": unit.get("title", ""),
+        "section_title": unit.get("section_title", ""),
+        "lesson_type": unit.get("lesson_type", ""),
+        "source_chunk_ids": list(unit.get("source_chunk_ids", [])),
+    }
 
 
 def _bad_independent_lesson_title(title: str) -> bool:
@@ -3155,7 +3263,7 @@ def _normalize_llm_units(raw: dict[str, Any], state: CourseCompileState) -> tupl
                 "lesson_type": _normalize_lesson_type(str(item.get("lesson_type", "")).strip()),
                 "course_style": _course_style(state.get("compile_profile", {})),
                 "summary": _short_text(str(item.get("summary", "")).strip() or _summarize_group(combined, title), 3200 if detailed else 1200),
-                "teaching_notes": str(item.get("teaching_notes", "")).strip(),
+                "teaching_notes": _normalize_teaching_notes(item.get("teaching_notes", "")),
                 "source_highlights": [str(value).strip() for value in item.get("source_highlights", []) if str(value).strip()][:12]
                 or _source_highlights_for_lesson(combined, title, max_lines=18 if detailed else 8),
                 "detailed_lesson": detailed,
@@ -3172,6 +3280,15 @@ def _normalize_llm_units(raw: dict[str, Any], state: CourseCompileState) -> tupl
             }
         )
     return _merge_duplicate_or_bad_units(units, chunk_by_id)
+
+
+def _normalize_teaching_notes(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    return {"explanation": text}
 
 
 def _fallback_extract_units(state: CourseCompileState) -> list[dict[str, Any]]:
@@ -3232,6 +3349,188 @@ def _fallback_extract_units(state: CourseCompileState) -> list[dict[str, Any]]:
     return units
 
 
+def _extract_units_system_prompt() -> str:
+    return (
+        "You are the structure-extraction agent in a course compiler. Extract medium-grain learning units from source chunks. "
+        "Return strict JSON only. Preserve source chunk ids and provenance; do not invent facts."
+    )
+
+
+def _extract_units_user_prompt(
+    state: CourseCompileState,
+    chunks: list[dict[str, Any]],
+    candidate_units: list[dict[str, Any]],
+    max_chunk_chars: int = 360,
+) -> str:
+    return (
+        "Return JSON with schema:\n"
+        "{\"units\":[{\"title\":\"...\",\"section_title\":\"...\",\"lesson_type\":\"concept|task|example|troubleshooting|reference\","
+        "\"summary\":\"...\",\"teaching_notes\":\"...\",\"source_highlights\":[\"...\"],\"source_chunk_ids\":[\"...\"],"
+        "\"content_type\":\"source_supported|inferred_from_source|bridge|needs_confirmation\"}],"
+        "\"rejected_fragments\":[{\"title\":\"...\",\"reason\":\"...\",\"source_chunk_ids\":[\"...\"]}]}\n\n"
+        "Requirements:\n"
+        "- Prefer semantic, medium-grain course units over slide-by-slide chunks.\n"
+        "- Merge short concepts, teacher hints, image captions, page notes, author/PPT metadata, and layout-only visual descriptions into nearby real units; never make them standalone lessons.\n"
+        "- Merge duplicate or near-duplicate titles into one unit.\n"
+        "- Every unit must cite existing source_chunk_ids only.\n"
+        "- Keep source order and course plan order unless a task-first organization is clearly requested.\n"
+        "- Candidate units are planning hints, not mandatory one-to-one outputs.\n\n"
+        f"Course style: {_course_style(state.get('compile_profile', {}))}\n"
+        f"Candidate units:\n{json.dumps([_fallback_unit_candidate_for_prompt(unit) for unit in candidate_units], ensure_ascii=False)}\n\n"
+        f"Source chunks:\n{_chunks_for_structure_prompt(chunks, len(chunks), max_chars=max_chunk_chars)}"
+    )
+
+
+def _candidate_unit_chunks(candidate_units: list[dict[str, Any]], chunk_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    chunk_ids: list[str] = []
+    for unit in candidate_units:
+        chunk_ids.extend(str(chunk_id) for chunk_id in unit.get("source_chunk_ids", []))
+    return [chunk_by_id[chunk_id] for chunk_id in _dedupe_keep_order(chunk_ids) if chunk_id in chunk_by_id]
+
+
+def _candidate_unit_batches(
+    state: CourseCompileState,
+    fallback_units: list[dict[str, Any]],
+    chunk_by_id: dict[str, dict[str, Any]],
+    system: str,
+    prompt_limit: int,
+) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for unit in fallback_units:
+        candidate = current + [unit]
+        chunks = _candidate_unit_chunks(candidate, chunk_by_id)
+        prompt = _extract_units_user_prompt(state, chunks, candidate)
+        if _prompt_char_count(system, prompt) <= prompt_limit:
+            current = candidate
+            continue
+        if current:
+            batches.append(current)
+            current = [unit]
+            chunks = _candidate_unit_chunks(current, chunk_by_id)
+            prompt = _extract_units_user_prompt(state, chunks, current)
+        if _prompt_char_count(system, prompt) <= prompt_limit:
+            continue
+        split_units = _split_large_candidate_unit(state, unit, chunk_by_id, system, prompt_limit)
+        batches.extend(split_units)
+        current = []
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _split_large_candidate_unit(
+    state: CourseCompileState,
+    unit: dict[str, Any],
+    chunk_by_id: dict[str, dict[str, Any]],
+    system: str,
+    prompt_limit: int,
+) -> list[list[dict[str, Any]]]:
+    chunk_ids = [str(chunk_id) for chunk_id in unit.get("source_chunk_ids", []) if str(chunk_id) in chunk_by_id]
+    if not chunk_ids:
+        return [[unit]]
+    batches: list[list[dict[str, Any]]] = []
+    current_ids: list[str] = []
+    for chunk_id in chunk_ids:
+        candidate_ids = current_ids + [chunk_id]
+        candidate_unit = {**unit, "source_chunk_ids": candidate_ids}
+        chunks = [chunk_by_id[item] for item in candidate_ids]
+        prompt = _extract_units_user_prompt(state, chunks, [candidate_unit], max_chunk_chars=260)
+        if _prompt_char_count(system, prompt) <= prompt_limit:
+            current_ids = candidate_ids
+            continue
+        if current_ids:
+            batches.append([{**unit, "source_chunk_ids": current_ids}])
+            current_ids = [chunk_id]
+            chunks = [chunk_by_id[chunk_id]]
+            prompt = _extract_units_user_prompt(state, chunks, [{**unit, "source_chunk_ids": current_ids}], max_chunk_chars=220)
+        if _prompt_char_count(system, prompt) > prompt_limit:
+            batches.append([{**unit, "source_chunk_ids": [chunk_id]}])
+            current_ids = []
+    if current_ids:
+        batches.append([{**unit, "source_chunk_ids": current_ids}])
+    return batches
+
+
+def _complete_extract_units_json(
+    client: Any,
+    course_path: Path,
+    state: CourseCompileState,
+    fallback_units: list[dict[str, Any]],
+    refresh: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    system = _extract_units_system_prompt()
+    prompt_limit = _llm_prompt_char_limit(state)
+    chunk_by_id = {chunk["id"]: chunk for chunk in state["parsed_chunks"]}
+    direct_user = _extract_units_user_prompt(
+        state,
+        state["parsed_chunks"][: int(state.get("compile_profile", {}).get("max_structure_chunks", 180))],
+        fallback_units,
+    )
+    if _prompt_char_count(system, direct_user) <= prompt_limit:
+        return _complete_structure_json(
+            client,
+            course_path,
+            "structure-units",
+            system,
+            direct_user,
+            "units_result",
+            refresh=refresh,
+            prompt_char_limit=prompt_limit,
+        )
+
+    batches = _candidate_unit_batches(state, fallback_units, chunk_by_id, system, prompt_limit)
+    all_units: list[dict[str, Any]] = []
+    all_rejected: list[dict[str, Any]] = []
+    batch_meta: list[dict[str, Any]] = []
+    for index, batch_units in enumerate(batches, start=1):
+        chunks = _candidate_unit_chunks(batch_units, chunk_by_id)
+        user = _extract_units_user_prompt_for_limit(state, chunks, batch_units, system, prompt_limit)
+        raw, meta = _complete_structure_json(
+            client,
+            course_path,
+            f"structure-units-batch-{index:03d}",
+            system,
+            user,
+            "units_result",
+            refresh=refresh,
+            prompt_char_limit=prompt_limit,
+        )
+        all_units.extend(raw.get("units", []))
+        all_rejected.extend(raw.get("rejected_fragments", []))
+        batch_meta.append(
+            {
+                **meta,
+                "batch_index": index,
+                "batch_count": len(batches),
+                "candidate_unit_titles": [str(unit.get("title", "")) for unit in batch_units],
+            }
+        )
+    return {
+        "units": all_units,
+        "rejected_fragments": all_rejected,
+    }, {
+        "local_cache": "split_batches",
+        "batch_count": len(batches),
+        "prompt_char_limit": prompt_limit,
+        "batches": batch_meta,
+    }
+
+
+def _extract_units_user_prompt_for_limit(
+    state: CourseCompileState,
+    chunks: list[dict[str, Any]],
+    candidate_units: list[dict[str, Any]],
+    system: str,
+    prompt_limit: int,
+) -> str:
+    for max_chunk_chars in (360, 300, 260, 220, 180, 140, 100):
+        user = _extract_units_user_prompt(state, chunks, candidate_units, max_chunk_chars=max_chunk_chars)
+        if _prompt_char_count(system, user) <= prompt_limit:
+            return user
+    return _extract_units_user_prompt(state, chunks, candidate_units, max_chunk_chars=80)
+
+
 def extract_units(state: CourseCompileState, vault_root: Path | str = "course-vault") -> CourseCompileState:
     """Extract course units with an LLM-first path and gated local fallback."""
 
@@ -3255,35 +3554,12 @@ def extract_units(state: CourseCompileState, vault_root: Path | str = "course-va
             {"units": fallback_units, "fallback_kind": "local_grouping_bad_sample"},
         )
 
-    system = (
-        "You are the structure-extraction agent in a course compiler. Extract medium-grain learning units from source chunks. "
-        "Return strict JSON only. Preserve source chunk ids and provenance; do not invent facts."
-    )
-    user = (
-        "Return JSON with schema:\n"
-        "{\"units\":[{\"title\":\"...\",\"section_title\":\"...\",\"lesson_type\":\"concept|task|example|troubleshooting|reference\","
-        "\"summary\":\"...\",\"teaching_notes\":\"...\",\"source_highlights\":[\"...\"],\"source_chunk_ids\":[\"...\"],"
-        "\"content_type\":\"source_supported|inferred_from_source|bridge|needs_confirmation\"}],"
-        "\"rejected_fragments\":[{\"title\":\"...\",\"reason\":\"...\",\"source_chunk_ids\":[\"...\"]}]}\n\n"
-        "Requirements:\n"
-        "- Prefer semantic, medium-grain course units over slide-by-slide chunks.\n"
-        "- Merge short concepts, teacher hints, image captions, page notes, author/PPT metadata, and layout-only visual descriptions into nearby real units; never make them standalone lessons.\n"
-        "- Merge duplicate or near-duplicate titles into one unit.\n"
-        "- Every unit must cite existing source_chunk_ids only.\n"
-        "- Keep source order and course plan order unless a task-first organization is clearly requested.\n\n"
-        f"Course style: {_course_style(state.get('compile_profile', {}))}\n"
-        f"Course plan:\n{json.dumps(state.get('course_plan', {}), ensure_ascii=False)[:9000]}\n\n"
-        f"Lesson notes:\n{json.dumps(state.get('lesson_notes', {}), ensure_ascii=False)[:9000]}\n\n"
-        f"Source chunks:\n{_chunks_for_structure_prompt(state['parsed_chunks'], int(state.get('compile_profile', {}).get('max_structure_chunks', 180)))}"
-    )
     try:
-        raw, meta = _complete_structure_json(
+        raw, meta = _complete_extract_units_json(
             client,
             course_path,
-            "structure-units",
-            system,
-            user,
-            "units_result",
+            state,
+            fallback_units,
             refresh=bool(state.get("compile_profile", {}).get("refresh_llm_structure")),
         )
         units, rejected = _normalize_llm_units(raw, state)
@@ -4337,7 +4613,7 @@ def organize_logic(state: CourseCompileState, vault_root: Path | str = "course-v
         "- Prefer learning prerequisites and semantic relations over simple adjacency.\n"
         "- Do not create new units or edges to missing ids.\n"
         "- Do not promote examples, image captions, page metadata, author notes, or teacher hints into graph nodes; use existing unit ids only.\n\n"
-        f"Units:\n{json.dumps(state['units'], ensure_ascii=False)[:26000]}"
+        f"Units:\n{_compact_units_for_prompt(state['units'], max_chars=10500, summary_chars=240)}"
     )
     try:
         raw, meta = _complete_structure_json(
@@ -4348,6 +4624,7 @@ def organize_logic(state: CourseCompileState, vault_root: Path | str = "course-v
             user,
             "logic_graph",
             refresh=bool(state.get("compile_profile", {}).get("refresh_llm_structure")),
+            prompt_char_limit=_llm_prompt_char_limit(state),
         )
         logic_graph = _normalize_logic_graph(raw, state)
         state["logic_graph"] = logic_graph
@@ -4407,6 +4684,11 @@ def _fallback_gap_report(state: CourseCompileState) -> dict[str, Any]:
 
 def _normalize_gap_report(raw: dict[str, Any], state: CourseCompileState) -> dict[str, Any]:
     valid_units = {unit["id"] for unit in state["units"]}
+    unit_title_by_id = {unit["id"]: _normalize_title(str(unit.get("title", ""))) for unit in state["units"]}
+    unit_ids_by_title: dict[str, list[str]] = {}
+    for unit_id, title_key in unit_title_by_id.items():
+        if title_key:
+            unit_ids_by_title.setdefault(title_key, []).append(unit_id)
     allowed_types = {
         "empty_summary",
         "thin_explanation",
@@ -4430,6 +4712,12 @@ def _normalize_gap_report(raw: dict[str, Any], state: CourseCompileState) -> dic
         severity = str(item.get("severity", "medium")).strip().lower()
         if severity not in {"high", "medium", "low"}:
             severity = "medium"
+        if gap_type == "duplicate_title":
+            exact_duplicates = unit_ids_by_title.get(unit_title_by_id.get(unit_id, ""), [])
+            if len(exact_duplicates) < 2:
+                gap_type = "over_split_fragment"
+                if severity == "high":
+                    severity = "medium"
         items.append(
             {
                 "unit_id": unit_id,
@@ -4490,8 +4778,8 @@ def detect_gaps(state: CourseCompileState, vault_root: Path | str = "course-vaul
         "duplicate_title|bad_independent_fragment|missing_source_provenance|coverage_gap|ordering_gap|over_split_fragment\","
         "\"severity\":\"high|medium|low\",\"message\":\"...\",\"source_chunk_ids\":[\"...\"]}]}\n\n"
         "Must flag as high severity when a standalone unit is only a short concept, teacher hint, image caption, page note, PPT author metadata, layout note, or duplicate title.\n\n"
-        f"Units:\n{json.dumps(state['units'], ensure_ascii=False)[:22000]}\n\n"
-        f"Logic graph:\n{json.dumps(state.get('logic_graph', {}), ensure_ascii=False)[:10000]}"
+        f"Units:\n{_compact_units_for_prompt(state['units'], max_chars=9000, summary_chars=220)}\n\n"
+        f"Logic graph:\n{_compact_logic_graph_for_prompt(state.get('logic_graph', {}), max_chars=3000)}"
     )
     try:
         raw, meta = _complete_structure_json(
@@ -4502,6 +4790,7 @@ def detect_gaps(state: CourseCompileState, vault_root: Path | str = "course-vaul
             user,
             "gap_report",
             refresh=bool(state.get("compile_profile", {}).get("refresh_llm_structure")),
+            prompt_char_limit=_llm_prompt_char_limit(state),
         )
         gap_report = _normalize_gap_report(raw, state)
         state["gap_report"] = gap_report
@@ -4692,6 +4981,123 @@ def _normalize_llm_lessons(raw: dict[str, Any], state: CourseCompileState) -> tu
     return lessons, concepts, outline, rejected
 
 
+def _generate_lessons_system_prompt() -> str:
+    return (
+        "You are the lesson-drafting agent in a course compiler. Draft readable, source-grounded lesson records from validated units. "
+        "Return strict JSON only."
+    )
+
+
+def _generate_lessons_user_prompt(
+    state: CourseCompileState,
+    generation_evidence: dict[str, Any],
+    units: list[dict[str, Any]],
+    units_max_chars: int = 7600,
+    evidence_max_chars: int = 1600,
+    gap_max_chars: int = 1600,
+    graph_max_chars: int = 1600,
+) -> str:
+    return (
+        "Return JSON with schema:\n"
+        "{\"lessons\":[{\"title\":\"...\",\"section_title\":\"...\",\"lesson_type\":\"concept|task|example|troubleshooting|reference\","
+        "\"unit_ids\":[\"unit-001\"],\"body\":\"...\",\"checklist\":[\"...\"]}],"
+        "\"rejected_fragments\":[{\"title\":\"...\",\"reason\":\"...\",\"unit_ids\":[\"...\"]}]}\n\n"
+        "Requirements:\n"
+        "- Generate medium-grain lessons only. Do not create standalone lessons for short concepts, teacher hints, image captions, page notes, PPT author metadata, or layout-only comments.\n"
+        "- Merge duplicate titles and attach examples or notes to their parent conceptual lesson.\n"
+        "- Every lesson must cite existing unit_ids only; provenance will be copied from those units.\n"
+        "- Body should be a concise draft; detailed body writing can happen later.\n\n"
+        f"Units:\n{_compact_units_for_prompt(units, max_chars=units_max_chars, summary_chars=180)}\n\n"
+        f"Pre-generation evidence:\n{_lesson_generation_evidence_for_prompt(generation_evidence, max_chars=evidence_max_chars)}\n\n"
+        f"Gap report:\n{_compact_gap_report_for_prompt(state.get('gap_report', {}), max_chars=gap_max_chars)}\n\n"
+        f"Logic graph:\n{_compact_logic_graph_for_prompt(state.get('logic_graph', {}), max_chars=graph_max_chars)}"
+    )
+
+
+def _unit_batches_for_lesson_generation(
+    state: CourseCompileState,
+    generation_evidence: dict[str, Any],
+    system: str,
+    prompt_limit: int,
+) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for unit in state["units"]:
+        candidate = current + [unit]
+        user = _generate_lessons_user_prompt(state, generation_evidence, candidate)
+        if _prompt_char_count(system, user) <= prompt_limit:
+            current = candidate
+            continue
+        if current:
+            batches.append(current)
+            current = [unit]
+            user = _generate_lessons_user_prompt(state, generation_evidence, current, units_max_chars=5200, evidence_max_chars=900, gap_max_chars=900, graph_max_chars=900)
+        if _prompt_char_count(system, user) > prompt_limit:
+            batches.append([unit])
+            current = []
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _complete_generate_lessons_json(
+    client: Any,
+    target_dir: Path,
+    state: CourseCompileState,
+    generation_evidence: dict[str, Any],
+    refresh: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    system = _generate_lessons_system_prompt()
+    prompt_limit = _llm_prompt_char_limit(state)
+    direct_user = _generate_lessons_user_prompt(state, generation_evidence, state["units"])
+    if _prompt_char_count(system, direct_user) <= prompt_limit:
+        return _complete_structure_json(
+            client,
+            target_dir,
+            "structure-lessons",
+            system,
+            direct_user,
+            "lessons_result",
+            refresh=refresh,
+            prompt_char_limit=prompt_limit,
+        )
+
+    batches = _unit_batches_for_lesson_generation(state, generation_evidence, system, prompt_limit)
+    all_lessons: list[dict[str, Any]] = []
+    all_rejected: list[dict[str, Any]] = []
+    batch_meta: list[dict[str, Any]] = []
+    for index, units in enumerate(batches, start=1):
+        user = _generate_lessons_user_prompt(state, generation_evidence, units, units_max_chars=7000, evidence_max_chars=1200, gap_max_chars=1200, graph_max_chars=1200)
+        if _prompt_char_count(system, user) > prompt_limit:
+            user = _generate_lessons_user_prompt(state, generation_evidence, units, units_max_chars=5200, evidence_max_chars=800, gap_max_chars=800, graph_max_chars=800)
+        raw, meta = _complete_structure_json(
+            client,
+            target_dir,
+            f"structure-lessons-batch-{index:03d}",
+            system,
+            user,
+            "lessons_result",
+            refresh=refresh,
+            prompt_char_limit=prompt_limit,
+        )
+        all_lessons.extend(raw.get("lessons", []))
+        all_rejected.extend(raw.get("rejected_fragments", []))
+        batch_meta.append(
+            {
+                **meta,
+                "batch_index": index,
+                "batch_count": len(batches),
+                "unit_ids": [str(unit.get("id", "")) for unit in units],
+            }
+        )
+    return {"lessons": all_lessons, "rejected_fragments": all_rejected}, {
+        "local_cache": "split_batches",
+        "batch_count": len(batches),
+        "prompt_char_limit": prompt_limit,
+        "batches": batch_meta,
+    }
+
+
 def generate_lessons(state: CourseCompileState, vault_root: Path | str = "course-vault") -> CourseCompileState:
     """Generate lesson drafts with an LLM-first path and provenance enforcement."""
 
@@ -4724,33 +5130,12 @@ def generate_lessons(state: CourseCompileState, vault_root: Path | str = "course
             {"lessons": fallback_lessons, "concepts": fallback_concepts, "outline": fallback_outline, "fallback_kind": "local_lesson_bad_sample"},
         )
 
-    system = (
-        "You are the lesson-drafting agent in a course compiler. Draft readable, source-grounded lesson records from validated units. "
-        "Return strict JSON only."
-    )
-    user = (
-        "Return JSON with schema:\n"
-        "{\"lessons\":[{\"title\":\"...\",\"section_title\":\"...\",\"lesson_type\":\"concept|task|example|troubleshooting|reference\","
-        "\"unit_ids\":[\"unit-001\"],\"body\":\"...\",\"checklist\":[\"...\"]}],"
-        "\"rejected_fragments\":[{\"title\":\"...\",\"reason\":\"...\",\"unit_ids\":[\"...\"]}]}\n\n"
-        "Requirements:\n"
-        "- Generate medium-grain lessons only. Do not create standalone lessons for short concepts, teacher hints, image captions, page notes, PPT author metadata, or layout-only comments.\n"
-        "- Merge duplicate titles and attach examples or notes to their parent conceptual lesson.\n"
-        "- Every lesson must cite existing unit_ids only; provenance will be copied from those units.\n"
-        "- Body should be a concise draft; detailed body writing can happen later.\n\n"
-        f"Units:\n{json.dumps(state['units'], ensure_ascii=False)[:26000]}\n\n"
-        f"Pre-generation evidence:\n{_lesson_generation_evidence_for_prompt(generation_evidence)}\n\n"
-        f"Gap report:\n{json.dumps(state.get('gap_report', {}), ensure_ascii=False)[:10000]}\n\n"
-        f"Logic graph:\n{json.dumps(state.get('logic_graph', {}), ensure_ascii=False)[:10000]}"
-    )
     try:
-        raw, meta = _complete_structure_json(
+        raw, meta = _complete_generate_lessons_json(
             client,
             target_dir,
-            "structure-lessons",
-            system,
-            user,
-            "lessons_result",
+            state,
+            generation_evidence,
             refresh=bool(state.get("compile_profile", {}).get("refresh_llm_structure")),
         )
         lessons, concepts, outline, rejected = _normalize_llm_lessons(raw, state)
@@ -4840,6 +5225,7 @@ def synthesize_compile_plan(state: CourseCompileState, vault_root: Path | str = 
     target_dir = course_dir(Path(vault_root), state["course_id"])
     compile_plan = _build_compile_plan(state)
     state["compile_plan"] = compile_plan
+    state["compile_plan_revisions"] = []
     write_json(target_dir / "compile_plan.json", compile_plan)
     (target_dir / "compile_plan.md").write_text(_render_compile_plan_markdown(compile_plan), encoding="utf-8")
     state["next_action"] = "review_compile_plan_llm"
@@ -4851,7 +5237,7 @@ def review_compile_plan_llm(state: CourseCompileState, vault_root: Path | str = 
 
     target_dir = course_dir(Path(vault_root), state["course_id"])
     plan = state.get("compile_plan") or _build_compile_plan(state)
-    plan_markdown = _render_compile_plan_markdown(plan)
+    plan_prompt = _compile_plan_review_prompt_payload(plan)
     local_review = _local_compile_plan_review(plan)
     llm_required = _requires_compile_plan_llm_review(state)
     client = LLMClient.from_env() if llm_required else None
@@ -4887,7 +5273,10 @@ def review_compile_plan_llm(state: CourseCompileState, vault_root: Path | str = 
             "\"revise_prompt\":{\"objective\":\"...\",\"actions\":[\"merge_lessons|rename_lesson|move_image|remove_visual_note|flag_manual_confirmation\"],"
             "\"details\":[{\"target\":\"lesson-001\",\"instruction\":\"...\"}]}}\n\n"
             "Must check: uneven lesson granularity, short concepts as standalone chapters, duplicate titles, random image insertion, visual/layout notes polluting body, and formulas mixed with Markdown lists/tables.\n\n"
-            f"{plan_markdown}"
+            "Important: this review happens before final lesson body generation. Concise draft bodies and low estimated token counts are acceptable when unit_ids and source_blocks are present. "
+            "Do not fail a lesson only because source_pages is empty; many parsed chunks have no page number, and source_blocks/source chunk ids are authoritative. "
+            "Use high severity only for missing unit/source-block coverage, monolithic or duplicate lesson structure, standalone metadata fragments, or image ownership that contradicts source_chunk_ids.\n\n"
+            f"Compile plan summary:\n{plan_prompt}"
         )
         try:
             raw, meta = _complete_structure_json(
@@ -4898,6 +5287,7 @@ def review_compile_plan_llm(state: CourseCompileState, vault_root: Path | str = 
                 user,
                 "compile_plan_review",
                 refresh=bool(state.get("compile_profile", {}).get("refresh_compile_plan_review")),
+                prompt_char_limit=_llm_prompt_char_limit(state),
             )
             llm_review = _normalize_compile_plan_review(raw)
             llm_review["metadata"] = meta
@@ -4927,14 +5317,101 @@ def review_compile_plan_llm(state: CourseCompileState, vault_root: Path | str = 
     return state
 
 
+def _compile_plan_review_prompt_payload(plan: dict[str, Any], max_chars: int = 11500) -> str:
+    payload = {
+        "course_id": plan.get("course_id", ""),
+        "material_scope": plan.get("material_scope", {}),
+        "image_insert_strategy": plan.get("image_insert_strategy", {}),
+        "revision_count": plan.get("revision_count", 0),
+        "lessons": [
+            {
+                "lesson_id": lesson.get("lesson_id", ""),
+                "title": lesson.get("title", ""),
+                "section_title": lesson.get("section_title", ""),
+                "unit_ids": lesson.get("unit_ids", []),
+                "source_pages": lesson.get("source_pages", [])[:12],
+                "source_blocks": lesson.get("source_blocks", [])[:12],
+                "source_count": len(lesson.get("sources", [])),
+                "image_count": lesson.get("image_insert_strategy", {}).get("image_count", 0),
+                "pending_images": lesson.get("image_insert_strategy", {}).get("pending_count", 0),
+                "random_image_count": len(lesson.get("image_insert_strategy", {}).get("random_insertion_risk_ids", [])),
+                "risks": lesson.get("risks", []),
+            }
+            for lesson in plan.get("hierarchy", {}).get("lessons", [])
+        ],
+        "risk_warnings": [risk for risk in plan.get("risk_warnings", []) if risk.get("severity") == "high"],
+        "manual_confirmation_items": plan.get("manual_confirmation_items", [])[:40],
+    }
+    return _short_text(json.dumps(payload, ensure_ascii=False), max_chars)
+
+
 def revise_compile_plan(state: CourseCompileState, vault_root: Path | str = "course-vault") -> CourseCompileState:
     """Apply bounded structural revisions from the review prompt and re-enter review."""
 
     target_dir = course_dir(Path(vault_root), state["course_id"])
-    max_revisions = int(state.get("compile_profile", {}).get("compile_plan_max_revisions", 2))
+    max_revisions = int(state.get("compile_profile", {}).get("compile_plan_max_revisions", 4))
     revisions = list(state.get("compile_plan_revisions", []))
     review = state.get("compile_plan_review", {})
     if len(revisions) >= max_revisions:
+        if _needs_finer_split(review):
+            before_titles = [lesson.get("title", "") for lesson in state.get("lessons", [])]
+            revised_lessons, actions = _apply_compile_plan_revisions(state.get("lessons", []), review, state.get("units", []))
+            revision_record = {
+                "attempt": len(revisions) + 1,
+                "review_passed": bool(review.get("passed")),
+                "issues": review.get("issues", []),
+                "revise_prompt": review.get("revise_prompt", {}),
+                "actions": actions,
+                "before_titles": before_titles,
+                "after_titles": [lesson.get("title", "") for lesson in revised_lessons],
+                "revision_stage": "lesson_body_finer_split_after_review_limit",
+            }
+            revisions.append(revision_record)
+            state["compile_plan_revisions"] = revisions
+            if any(action.get("action") == "split_lesson" for action in actions):
+                state["lessons"] = revised_lessons
+                state["outline"] = {
+                    "course_id": state["course_id"],
+                    "lesson_count": len(revised_lessons),
+                    "sections": _outline_sections(revised_lessons),
+                    "lessons": [
+                        {
+                            "id": lesson["id"],
+                            "title": lesson["title"],
+                            "section_title": lesson.get("section_title", ""),
+                            "lesson_type": lesson.get("lesson_type", ""),
+                            "unit_ids": lesson.get("unit_ids", []),
+                            "source_count": len(lesson.get("sources", [])),
+                        }
+                        for lesson in revised_lessons
+                    ],
+                }
+                state["compile_plan"] = _build_compile_plan(state)
+                write_json(target_dir / "lessons.json", state["lessons"])
+                write_json(target_dir / "outline.json", state["outline"])
+                write_json(target_dir / "compile_plan.json", state["compile_plan"])
+                (target_dir / "compile_plan.md").write_text(_render_compile_plan_markdown(state["compile_plan"]), encoding="utf-8")
+                write_json(
+                    target_dir / "compile_plan_revision_log.json",
+                    {"revisions": revisions, "max_revisions": max_revisions, "status": "lesson_body_finer_split_after_review_limit"},
+                )
+                state["next_action"] = "synthesize_lesson_bodies"
+                return state
+            write_json(target_dir / "compile_plan_revision_log.json", {"revisions": revisions, "max_revisions": max_revisions, "status": "fallback_generate_lessons"})
+            state["next_action"] = "generate_lessons"
+            return state
+        if max_revisions >= 4 and _can_continue_after_compile_plan_revision_exhaustion(review):
+            write_json(
+                target_dir / "compile_plan_revision_log.json",
+                {
+                    "revisions": revisions,
+                    "max_revisions": max_revisions,
+                    "status": "advisory_exhausted_continue",
+                    "continued_after_advisory_llm_review": True,
+                },
+            )
+            state["next_action"] = "synthesize_lesson_bodies"
+            return state
         state["errors"].append(
             {
                 "node": "revise_compile_plan",
@@ -4993,6 +5470,21 @@ def revise_compile_plan(state: CourseCompileState, vault_root: Path | str = "cou
     write_json(target_dir / "compile_plan_revision_log.json", {"revisions": revisions, "max_revisions": max_revisions, "status": "revised"})
     state["next_action"] = "review_compile_plan_llm"
     return state
+
+
+def _can_continue_after_compile_plan_revision_exhaustion(review: dict[str, Any]) -> bool:
+    issues = list(review.get("issues", []))
+    if any(str(issue.get("type", "")) == "needs_finer_split" or issue.get("needs_finer_split") for issue in issues):
+        return False
+    local_meta = review.get("local_metadata", {})
+    if local_meta.get("mode") != "local_rule_review":
+        return False
+    local_high = [
+        issue
+        for issue in issues
+        if issue.get("severity") == "high" and str(issue.get("message", "")) in {"image_random_insert", "thin_lesson_draft", "short_fragment_chapter"}
+    ]
+    return not local_high
 
 
 def _requires_compile_plan_llm_review(state: CourseCompileState) -> bool:
@@ -5383,7 +5875,9 @@ def _revise_prompt_from_issues(issues: list[dict[str, Any]]) -> dict[str, Any]:
         lesson_ids = issue.get("lesson_ids", [])
         if issue_type == "needs_finer_split":
             action = "split_lesson"
-        elif issue_type in {"duplicate_title", "short_fragment_chapter", "granularity"}:
+        elif issue_type == "granularity":
+            action = "split_lesson" if issue.get("severity") == "high" and lesson_ids else "flag_manual_confirmation"
+        elif issue_type in {"duplicate_title", "short_fragment_chapter", "thin_lesson_draft"}:
             action = "merge_lessons"
         elif issue_type == "image_random_insert":
             action = "move_image"
@@ -5437,10 +5931,21 @@ def _apply_compile_plan_revisions(
                 changed = _split_lesson_by_id(revised, lesson_id, unit_by_id)
                 if changed:
                     actions.append({"action": "split_lesson", "lesson_ids": [lesson_id], "issue_type": issue_type})
-        elif issue_type in {"duplicate_title", "short_fragment_chapter", "granularity"} and lesson_ids:
+        elif issue_type == "granularity" and lesson_ids and issue.get("severity") == "high":
+            split_ids: list[str] = []
+            for lesson_id in lesson_ids:
+                if _split_lesson_by_id(revised, lesson_id, unit_by_id):
+                    split_ids.append(lesson_id)
+            if split_ids:
+                actions.append({"action": "split_lesson", "lesson_ids": split_ids, "issue_type": issue_type})
+        elif issue_type in {"duplicate_title", "short_fragment_chapter", "thin_lesson_draft"} and lesson_ids:
             changed = _merge_lessons_by_ids(revised, lesson_ids)
+            if not changed and len(lesson_ids) == 1:
+                changed = _merge_lesson_with_neighbor(revised, lesson_ids[0])
             if changed:
                 actions.append({"action": "merge_lessons", "lesson_ids": lesson_ids, "issue_type": issue_type})
+        elif issue_type == "granularity":
+            actions.append({"action": "flag_manual_confirmation", "lesson_ids": lesson_ids, "issue_type": issue_type})
         elif issue_type == "visual_note_pollution":
             changed = _remove_visual_note_lines(revised, lesson_ids)
             if changed:
@@ -5541,6 +6046,8 @@ def _split_lesson_by_sources(lesson: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "title": _lesson_part_title(str(lesson.get("title", "")), part_index, len(groups)),
                 "body": body_parts[part_index - 1] if part_index - 1 < len(body_parts) else str(lesson.get("body", "")),
+                "unit_ids": [],
+                "source_chunk_ids": _dedupe_keep_order([str(source.get("chunk_id", "")) for source in group if source.get("chunk_id")]),
                 "sources": group,
                 "images": [image for image in lesson.get("images", []) if not image.get("source_chunk_id") or str(image.get("source_chunk_id")) in chunk_ids],
                 "pending_image_confirmations": [
@@ -5612,6 +6119,15 @@ def _merge_lessons_by_ids(lessons: list[dict[str, Any]], lesson_ids: list[str]) 
     return True
 
 
+def _merge_lesson_with_neighbor(lessons: list[dict[str, Any]], lesson_id: str) -> bool:
+    index = next((item for item, lesson in enumerate(lessons) if lesson.get("id") == lesson_id), -1)
+    if index < 0 or len(lessons) < 2:
+        return False
+    if index > 0:
+        return _merge_lessons_by_ids(lessons, [str(lessons[index - 1].get("id", "")), lesson_id])
+    return _merge_lessons_by_ids(lessons, [lesson_id, str(lessons[index + 1].get("id", ""))])
+
+
 def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
@@ -5657,6 +6173,9 @@ def _lesson_body_source_chunk_ids(
     unit_by_id: dict[str, dict[str, Any]],
     chunk_by_id: dict[str, dict[str, Any]],
 ) -> list[str]:
+    explicit_ids = [str(chunk_id) for chunk_id in lesson.get("source_chunk_ids", []) if str(chunk_id) in chunk_by_id]
+    if explicit_ids:
+        return _dedupe_keep_order(explicit_ids)
     units = [unit_by_id[unit_id] for unit_id in lesson.get("unit_ids", []) if unit_id in unit_by_id]
     source_chunk_ids: list[str] = []
     for unit in units:
@@ -5756,12 +6275,13 @@ def synthesize_lesson_bodies(state: CourseCompileState, vault_root: Path | str =
         evidence_pack = locator.get_context(source_chunk_ids, before=1, after=1)
 
         system, user = _lesson_body_generation_prompt(lesson, profile, learn_by_doing, source_chunk_ids, chunk_by_id)
+        prompt_text = system + "\n" + user
         density_check = _lesson_body_density_check(
             lesson,
             source_chunk_ids,
             chunk_by_id,
             profile,
-            user,
+            prompt_text,
             _compile_plan_lesson_by_id(state.get("compile_plan", {}), str(lesson.get("id", ""))),
         )
         density_checks.append(density_check)
@@ -5853,7 +6373,7 @@ def synthesize_lesson_bodies(state: CourseCompileState, vault_root: Path | str =
             body_record["body_markdown"] = _normalize_compiled_markdown(str(body_record["body_markdown"]))
             plain_chars = max(len(_plain_markdown_text(body_record["body_markdown"])), int(body_record.get("_raw_plain_chars", 0) or 0))
             generated_plain_total += plain_chars
-            if plain_chars > plain_limit or generated_plain_total > batch_plain_limit:
+            if plain_chars > plain_limit:
                 post_issue = _lesson_body_post_generation_limit_issue(
                     lesson,
                     body_record,
@@ -5918,7 +6438,7 @@ def _lesson_body_density_check(
     compile_plan_lesson: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     plain_limit = int(profile.get("lesson_body_plain_char_limit", 5000))
-    context_limit = int(profile.get("lesson_body_context_limit_chars", 24000))
+    context_limit = min(int(profile.get("lesson_body_context_limit_chars", 24000)), _llm_prompt_char_limit({"compile_profile": profile}))
     max_source_chunks = int(profile.get("lesson_body_max_source_chunks", 6))
     max_units = int(profile.get("lesson_body_max_units", 2))
     max_page_span = int(profile.get("lesson_body_max_page_span", 3))
@@ -5939,7 +6459,6 @@ def _lesson_body_density_check(
     formula_count = _formula_density_count(source_text + "\n" + draft_text)
     image_count = len(lesson.get("images", [])) + len(lesson.get("pending_image_confirmations", []))
     reasons: list[str] = []
-    reasons.extend(str(reason) for reason in plan_density.get("reasons", []) if str(reason))
     if estimated_plain_chars > plain_limit:
         reasons.append("estimated_plain_text_exceeds_limit")
     if len(prompt) > context_limit:
@@ -5950,7 +6469,15 @@ def _lesson_body_density_check(
         reasons.append("multiple_concepts_mixed")
     if len(pages) > max_pages or page_span > max_page_span:
         reasons.append("page_span_too_large")
-    if formula_count > max_formula_count:
+    formula_context_overloaded = (
+        len(prompt) > int(context_limit * 0.75)
+        or source_chars > plain_limit
+        or len(source_chunk_ids) > max_source_chunks
+        or unit_count > max_units
+        or len(pages) > max_pages
+        or page_span > max_page_span
+    )
+    if formula_count > max_formula_count and formula_context_overloaded:
         reasons.append("derivation_examples_or_formulas_too_dense")
     if image_count > max_images:
         reasons.append("formula_image_notes_concentrated")
@@ -5992,8 +6519,6 @@ def _lesson_body_post_generation_limit_issue(
     reasons = []
     if plain_chars > plain_limit:
         reasons.append("generated_lesson_plain_text_exceeds_limit")
-    if generated_plain_total > batch_plain_limit:
-        reasons.append("generated_batch_plain_text_exceeds_limit")
     return {
         "lesson_id": str(lesson.get("id", body_record.get("lesson_id", ""))),
         "title": str(lesson.get("title", body_record.get("title", ""))),
@@ -6037,7 +6562,10 @@ def _request_lesson_body_finer_split(
         "limits": {
             "lesson_body_plain_char_limit": int(state.get("compile_profile", {}).get("lesson_body_plain_char_limit", 5000)),
             "lesson_body_batch_plain_char_limit": int(state.get("compile_profile", {}).get("lesson_body_batch_plain_char_limit", 5000)),
-            "lesson_body_context_limit_chars": int(state.get("compile_profile", {}).get("lesson_body_context_limit_chars", 24000)),
+            "lesson_body_context_limit_chars": min(
+                int(state.get("compile_profile", {}).get("lesson_body_context_limit_chars", 24000)),
+                _llm_prompt_char_limit(state),
+            ),
         },
         "revision_prompt": {
             "objective": "Split dense lessons so each lesson is single-topic, fragmented-reading friendly, and generatable in one LLM call.",
@@ -6165,6 +6693,32 @@ def check_markdown_syntax(state: CourseCompileState, vault_root: Path | str = "c
         status = "passed" if not diagnostics else "failed"
         strategy = "none"
 
+        if diagnostics:
+            locally_repaired = _repair_markdown_syntax_locally(current_markdown, diagnostics)
+            if locally_repaired != current_markdown:
+                local_diagnostics, local_metadata = _markdown_syntax_diagnostics(locally_repaired)
+                local_diagnostics = _attach_lesson_to_markdown_diagnostics(local_diagnostics, lesson)
+                audit_entries.append(
+                    {
+                        "lesson_id": lesson_id,
+                        "round": "local",
+                        "agent": "markdown_local_repair",
+                        "errors_before": diagnostics,
+                        "markdown_before": current_markdown,
+                        "markdown_after": locally_repaired,
+                        "errors_after": local_diagnostics,
+                        "failure_reason": "" if not local_diagnostics else "syntax_errors_remain",
+                        "metadata": {"lint": local_metadata},
+                    }
+                )
+                current_markdown = locally_repaired
+                diagnostics = local_diagnostics
+                tool_metadata[lesson_id] = local_metadata
+                if not diagnostics:
+                    _apply_repaired_lesson_markdown(lesson, body_record, current_markdown)
+                    status = "repaired"
+                    strategy = "local_repair"
+
         if diagnostics and not repair_enabled:
             strategy = "unrepaired_disabled"
         elif diagnostics and client is None:
@@ -6181,6 +6735,7 @@ def check_markdown_syntax(state: CourseCompileState, vault_root: Path | str = "c
                 diagnostics,
                 max_rounds=max_rounds,
                 refresh=bool(profile.get("refresh_markdown_repair")),
+                prompt_char_limit=_llm_prompt_char_limit(state),
             )
             audit_entries.extend(repair_log)
             if not diagnostics:
@@ -6236,6 +6791,73 @@ def check_markdown_syntax(state: CourseCompileState, vault_root: Path | str = "c
     return state
 
 
+def _repair_markdown_syntax_locally(markdown: str, diagnostics: list[dict[str, Any]]) -> str:
+    error_types = {str(item.get("type", "")) for item in diagnostics}
+    repaired = markdown
+    if "formula_markdown_mix" in error_types:
+        repaired = _escape_display_math_list_markers(repaired)
+    if "list_indentation" in error_types:
+        repaired = _normalize_odd_list_indentation(repaired)
+    if "code_fence_missing_language" in error_types and "unclosed_code_fence" not in error_types:
+        repaired = _add_missing_code_fence_languages(repaired)
+    return repaired
+
+
+def _escape_display_math_list_markers(markdown: str) -> str:
+    lines = markdown.splitlines()
+    repaired: list[str] = []
+    in_math = False
+    math_fence = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped in {"$$", "\\["} and not in_math:
+            in_math = True
+            math_fence = stripped
+            repaired.append(line)
+            continue
+        if in_math and ((math_fence == "$$" and stripped == "$$") or (math_fence == "\\[" and stripped == "\\]")):
+            in_math = False
+            math_fence = ""
+            repaired.append(line)
+            continue
+        if in_math:
+            line = re.sub(r"^(\s*)([-*+])\s+", r"\1{}\2 ", line)
+        repaired.append(line)
+    return "\n".join(repaired) + ("\n" if markdown.endswith("\n") else "")
+
+
+def _normalize_odd_list_indentation(markdown: str) -> str:
+    lines = markdown.splitlines()
+    repaired: list[str] = []
+    for line in lines:
+        match = re.match(r"^(\s{1,})([-+*]|\d+[.)])(\s+.*)$", line)
+        if match and len(match.group(1)) % 2 != 0:
+            spaces = len(match.group(1))
+            normalized_spaces = spaces - 1 if spaces > 1 else 2
+            line = " " * normalized_spaces + match.group(2) + match.group(3)
+        repaired.append(line)
+    return "\n".join(repaired) + ("\n" if markdown.endswith("\n") else "")
+
+
+def _add_missing_code_fence_languages(markdown: str) -> str:
+    lines = markdown.splitlines()
+    open_fence = ""
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)(```+|~~~+)(.*)$", line)
+        if not match:
+            continue
+        indent, marker, info = match.groups()
+        marker3 = marker[:3]
+        if open_fence:
+            if marker3 == open_fence:
+                open_fence = ""
+            continue
+        open_fence = marker3
+        if not info.strip():
+            lines[index] = f"{indent}{marker}text"
+    return "\n".join(lines) + ("\n" if markdown.endswith("\n") else "")
+
+
 def _apply_repaired_lesson_markdown(lesson: dict[str, Any], body_record: dict[str, Any], markdown: str) -> None:
     cleaned = _trim_lesson_body(markdown.strip(), int(lesson.get("body_max_chars", 7200)))
     lesson["body"] = cleaned
@@ -6254,6 +6876,7 @@ def _repair_lesson_markdown_with_llm(
     *,
     max_rounds: int,
     refresh: bool,
+    prompt_char_limit: int = DEFAULT_LLM_PROMPT_CHAR_LIMIT,
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], str]:
     lesson_id = str(lesson.get("id", ""))
     current_markdown = initial_markdown
@@ -6261,7 +6884,7 @@ def _repair_lesson_markdown_with_llm(
     repair_log: list[dict[str, Any]] = []
     for round_index in range(1, max_rounds + 1):
         before = current_markdown
-        system, user = _markdown_repair_prompt(lesson, body_record, original_input, current_markdown, diagnostics, round_index)
+        system, user = _markdown_repair_prompt(lesson, body_record, original_input, current_markdown, diagnostics, round_index, prompt_char_limit=prompt_char_limit)
         raw, metadata = _complete_structure_json(
             client,
             course_path,
@@ -6303,6 +6926,7 @@ def _repair_lesson_markdown_with_llm(
         repair_log,
         diagnostics,
         refresh=refresh,
+        prompt_char_limit=prompt_char_limit,
     )
     repair_log.extend(summary_log)
     if regenerated:
@@ -6331,12 +6955,16 @@ def _markdown_repair_prompt(
     current_markdown: str,
     diagnostics: list[dict[str, Any]],
     round_index: int,
+    *,
+    prompt_char_limit: int = DEFAULT_LLM_PROMPT_CHAR_LIMIT,
 ) -> tuple[str, str]:
     system = (
         "You are continuing the Synthesize Lesson Bodies conversation for one course lesson. "
         "Repair Markdown syntax only while preserving the source-grounded lesson meaning. Return strict JSON only."
     )
-    user = (
+    diagnostics_json = json.dumps(diagnostics, ensure_ascii=False, indent=2)
+    checklist_json = json.dumps(body_record.get("checklist", lesson.get("checklist", [])), ensure_ascii=False)
+    rules = (
         "Return JSON with schema:\n"
         "{\"lesson_id\":\"lesson-001\",\"title\":\"...\",\"body_markdown\":\"完整修复版 Markdown\","
         "\"checklist\":[\"...\"],\"covered_source_chunk_ids\":[\"...\"],\"repair_notes\":\"...\"}\n\n"
@@ -6348,15 +6976,77 @@ def _markdown_repair_prompt(
         f"Repair round: {round_index}\n"
         f"Lesson id: {lesson.get('id')}\n"
         f"Lesson title: {lesson.get('title')}\n\n"
-        f"Original Synthesize Lesson Bodies system prompt:\n{_short_text(str(original_input.get('system_prompt', '')), 2500)}\n\n"
-        f"Original Synthesize Lesson Bodies user prompt:\n{_short_text(str(original_input.get('user_prompt', '')), 10000)}\n\n"
-        f"Current checklist:\n{json.dumps(body_record.get('checklist', lesson.get('checklist', [])), ensure_ascii=False)}\n\n"
+        f"Current checklist:\n{checklist_json}\n\n"
         "Structured Markdown errors:\n"
-        f"{json.dumps(diagnostics, ensure_ascii=False, indent=2)}\n\n"
-        "Current Markdown body:\n"
-        f"{current_markdown}"
+        f"{diagnostics_json}\n\n"
+    )
+    user = _fit_markdown_repair_user_prompt(
+        system,
+        rules,
+        original_input,
+        current_markdown,
+        prompt_char_limit=prompt_char_limit,
+        full_body_required=True,
     )
     return system, user
+
+
+def _fit_markdown_repair_user_prompt(
+    system: str,
+    prefix: str,
+    original_input: dict[str, Any],
+    current_markdown: str,
+    *,
+    prompt_char_limit: int,
+    full_body_required: bool,
+) -> str:
+    source_system = str(original_input.get("system_prompt", ""))
+    source_user = str(original_input.get("user_prompt", ""))
+    reserve = max(800, prompt_char_limit - len(system) - len(prefix) - len(current_markdown) - 200)
+    system_budget = min(1800, max(200, reserve // 4))
+    user_budget = min(5000, max(500, reserve - system_budget))
+    body = current_markdown
+    body_label = "Current Markdown body"
+    note = ""
+    user = _render_markdown_repair_user_prompt(prefix, source_system, source_user, body, system_budget, user_budget, body_label, note)
+    if _prompt_char_count(system, user) <= prompt_char_limit:
+        return user
+
+    system_budget = 500
+    user_budget = 1200
+    user = _render_markdown_repair_user_prompt(prefix, source_system, source_user, body, system_budget, user_budget, body_label, note)
+    if _prompt_char_count(system, user) <= prompt_char_limit:
+        return user
+
+    body_budget = max(1200, prompt_char_limit - len(system) - len(prefix) - 2500)
+    body = _short_text(current_markdown, body_budget)
+    body_label = "Current Markdown body excerpt"
+    note = (
+        "The full lesson body was too large for one repair prompt. Repair the visible excerpt and preserve structure; "
+        "do not invent source facts outside the supplied text.\n\n"
+    )
+    if full_body_required:
+        note += "If the complete body cannot fit, return the best complete body that preserves the supplied excerpt and checklist.\n\n"
+    return _render_markdown_repair_user_prompt(prefix, source_system, source_user, body, 400, 800, body_label, note)
+
+
+def _render_markdown_repair_user_prompt(
+    prefix: str,
+    source_system: str,
+    source_user: str,
+    current_markdown: str,
+    system_budget: int,
+    user_budget: int,
+    body_label: str,
+    note: str,
+) -> str:
+    return (
+        prefix
+        + note
+        + f"Original Synthesize Lesson Bodies system prompt:\n{_short_text(source_system, system_budget)}\n\n"
+        + f"Original Synthesize Lesson Bodies user prompt:\n{_short_text(source_user, user_budget)}\n\n"
+        + f"{body_label}:\n{current_markdown}"
+    )
 
 
 def _extract_repaired_markdown(raw: dict[str, Any]) -> str:
@@ -6378,19 +7068,32 @@ def _regenerate_lesson_markdown_after_repair_failures(
     diagnostics: list[dict[str, Any]],
     *,
     refresh: bool,
+    prompt_char_limit: int = DEFAULT_LLM_PROMPT_CHAR_LIMIT,
 ) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
     lesson_id = str(lesson.get("id", ""))
     summary_system = (
         "You are markdown_repair_summary_agent. Summarize repeated Markdown syntax failures and produce reusable repair rules. "
         "Return strict JSON only."
     )
+    compact_diagnostics = _compact_markdown_diagnostics(diagnostics, max_items=20)
+    compact_log = _compact_markdown_repair_log(repair_log, max_chars=max(1200, prompt_char_limit - len(summary_system) - len(json.dumps(compact_diagnostics, ensure_ascii=False)) - 1800))
     summary_user = (
         "Return JSON with schema:\n"
         "{\"repeated_error_types\":[\"...\"],\"likely_causes\":[\"...\"],\"repair_rules\":[\"...\"],\"regeneration_instruction\":\"...\"}\n\n"
         f"Lesson id: {lesson_id}\n"
-        f"Repair log:\n{json.dumps(repair_log, ensure_ascii=False, indent=2)}\n\n"
-        f"Remaining errors:\n{json.dumps(diagnostics, ensure_ascii=False, indent=2)}"
+        f"Repair log:\n{json.dumps(compact_log, ensure_ascii=False, indent=2)}\n\n"
+        f"Remaining errors:\n{json.dumps(compact_diagnostics, ensure_ascii=False, indent=2)}"
     )
+    if _prompt_char_count(summary_system, summary_user) > prompt_char_limit:
+        compact_log = _compact_markdown_repair_log(repair_log, max_chars=800, include_markdown=False)
+        compact_diagnostics = _compact_markdown_diagnostics(diagnostics, max_items=10)
+        summary_user = (
+            "Return JSON with schema:\n"
+            "{\"repeated_error_types\":[\"...\"],\"likely_causes\":[\"...\"],\"repair_rules\":[\"...\"],\"regeneration_instruction\":\"...\"}\n\n"
+            f"Lesson id: {lesson_id}\n"
+            f"Repair log:\n{json.dumps(compact_log, ensure_ascii=False, indent=2)}\n\n"
+            f"Remaining errors:\n{json.dumps(compact_diagnostics, ensure_ascii=False, indent=2)}"
+        )
     summary, summary_meta = _complete_structure_json(
         client,
         course_path,
@@ -6404,15 +7107,20 @@ def _regenerate_lesson_markdown_after_repair_failures(
         "You are a fresh Synthesize Lesson Bodies agent. Regenerate one complete source-grounded lesson body using the original input "
         "and the Markdown repair summary. Return strict JSON only."
     )
-    regen_user = (
+    regen_prefix = (
         "Return JSON with schema:\n"
         "{\"lesson_id\":\"lesson-001\",\"title\":\"...\",\"body_markdown\":\"完整 Markdown\","
         "\"checklist\":[\"...\"],\"covered_source_chunk_ids\":[\"...\"]}\n\n"
         "Use the original input as the source of truth. Apply the one-time Markdown repair guidance. Output a complete Markdown body.\n\n"
         f"Repair summary:\n{json.dumps(summary, ensure_ascii=False, indent=2)}\n\n"
-        f"Original Synthesize Lesson Bodies system prompt:\n{_short_text(str(original_input.get('system_prompt', '')), 2500)}\n\n"
-        f"Original Synthesize Lesson Bodies user prompt:\n{_short_text(str(original_input.get('user_prompt', '')), 10000)}\n\n"
-        f"Current failed Markdown body:\n{current_markdown}"
+    )
+    regen_user = _fit_markdown_repair_user_prompt(
+        regen_system,
+        regen_prefix,
+        original_input,
+        current_markdown,
+        prompt_char_limit=prompt_char_limit,
+        full_body_required=True,
     )
     regenerated_raw, regen_meta = _complete_structure_json(
         client,
@@ -6446,6 +7154,48 @@ def _regenerate_lesson_markdown_after_repair_failures(
         body_record["checklist"] = list(regenerated_raw.get("checklist", body_record.get("checklist", [])))[:8]
         body_record["covered_source_chunk_ids"] = list(regenerated_raw.get("covered_source_chunk_ids", body_record.get("covered_source_chunk_ids", [])))
     return summary, regenerated, log
+
+
+def _compact_markdown_repair_log(repair_log: list[dict[str, Any]], max_chars: int, include_markdown: bool = True) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    per_markdown = max(160, max_chars // max(1, len(repair_log) * 2))
+    for entry in repair_log:
+        compact_entry = {
+            "lesson_id": entry.get("lesson_id"),
+            "round": entry.get("round"),
+            "agent": entry.get("agent"),
+            "errors_before": _compact_markdown_diagnostics(list(entry.get("errors_before", [])), max_items=8),
+            "errors_after": _compact_markdown_diagnostics(list(entry.get("errors_after", [])), max_items=8),
+            "failure_reason": entry.get("failure_reason", ""),
+        }
+        if include_markdown and entry.get("markdown_before"):
+            compact_entry["markdown_before_excerpt"] = _short_text(str(entry.get("markdown_before", "")), per_markdown)
+        if include_markdown and entry.get("markdown_after"):
+            compact_entry["markdown_after_excerpt"] = _short_text(str(entry.get("markdown_after", "")), per_markdown)
+        compact.append(compact_entry)
+    return compact
+
+
+def _compact_markdown_diagnostics(diagnostics: list[dict[str, Any]], max_items: int = 20) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in diagnostics[:max_items]:
+        compact.append(
+            {
+                "type": item.get("type"),
+                "line": item.get("line"),
+                "column": item.get("column"),
+                "lesson_id": item.get("lesson_id"),
+                "reason": _short_text(str(item.get("reason", "")), 180),
+                "suggestion": _short_text(str(item.get("suggestion", "")), 180),
+            }
+        )
+    if len(diagnostics) > max_items:
+        type_counts: dict[str, int] = {}
+        for item in diagnostics[max_items:]:
+            key = str(item.get("type", "unknown"))
+            type_counts[key] = type_counts.get(key, 0) + 1
+        compact.append({"type": "truncated_diagnostics", "remaining_count": len(diagnostics) - max_items, "remaining_type_counts": type_counts})
+    return compact
 
 
 def _markdown_repair_audit_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -6491,7 +7241,7 @@ def _render_markdown_syntax_report(report: dict[str, Any]) -> str:
 
 def _lesson_body(unit: dict[str, Any]) -> str:
     section = f"Section: {unit['section_title']}\n\n" if unit.get("section_title") else ""
-    notes = unit.get("teaching_notes", {})
+    notes = _normalize_teaching_notes(unit.get("teaching_notes", {}))
     if unit.get("detailed_lesson"):
         return _detailed_lesson_body(unit, notes, section)
     if notes:
@@ -7085,6 +7835,10 @@ def _normalize_compiled_markdown(value: str) -> str:
             normalized.append(raw_line)
             continue
 
+        if stripped.startswith("$$") and stripped.endswith("$$") and stripped.count("$$") >= 2:
+            flush_formula()
+            normalized.append(line if (line := _strip_ocr_paragraph_marker(raw_line)) else raw_line)
+            continue
         if stripped in {"$$", "\\["} and not in_math:
             flush_formula()
             normalized.append(raw_line)
@@ -7184,6 +7938,8 @@ def _formula_markdown_mix_line(value: str) -> int | None:
     formula_env_depth = 0
     for index, line in enumerate(value.splitlines(), start=1):
         stripped = line.strip()
+        if stripped.startswith("$$") and stripped.endswith("$$") and stripped.count("$$") >= 2:
+            continue
         if stripped in {"$$", "\\["} and not in_math:
             in_math = True
             math_fence = stripped
@@ -7192,10 +7948,14 @@ def _formula_markdown_mix_line(value: str) -> int | None:
             in_math = False
             math_fence = ""
             continue
-        formula_env_depth += len(re.findall(r"\\begin\{(cases|[bpvVB]?matrix|aligned)\}", line))
+        begin_count = len(re.findall(r"\\begin\{(cases|[bpvVB]?matrix|aligned)\}", line))
+        end_count = len(re.findall(r"\\end\{(cases|[bpvVB]?matrix|aligned)\}", line))
+        line_env_depth = formula_env_depth + begin_count
         if (in_math or formula_env_depth > 0) and re.match(r"^[-*+]\s+", stripped):
             return index
-        formula_env_depth = max(0, formula_env_depth - len(re.findall(r"\\end\{(cases|[bpvVB]?matrix|aligned)\}", line)))
+        if line_env_depth > 0 and end_count < begin_count and re.match(r"^[-*+]\s+", stripped):
+            return index
+        formula_env_depth = max(0, formula_env_depth + begin_count - end_count)
     return None
 
 

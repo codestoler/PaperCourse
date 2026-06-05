@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+import requests
 
 
 def load_env(path: str | Path = ".env") -> dict[str, str]:
@@ -28,6 +31,7 @@ def load_env(path: str | Path = ".env") -> dict[str, str]:
         "LLM_ALLOW_GENERIC_FALLBACK",
         "LLM_ALLOW_SILICONFLOW_FALLBACK",
         "LLM_TIMEOUT",
+        "LLM_CONNECT_TIMEOUT",
         "LLM_RETRIES",
         "LLM_RETRY_BACKOFF_SECONDS",
         "GLM_ANTHROPIC_URL",
@@ -55,11 +59,13 @@ class LLMClient:
         provider: str = "openai",
         retries: int = 2,
         retry_backoff_seconds: float = 2.0,
+        connect_timeout: int | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.connect_timeout = max(1, connect_timeout if connect_timeout is not None else min(30, timeout))
         self.provider = provider
         self.retries = max(0, retries)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
@@ -69,17 +75,36 @@ class LLMClient:
     def from_env(cls) -> "LLMClient | None":
         values = load_env()
         timeout = int(values.get("LLM_TIMEOUT", "300"))
+        connect_timeout = int(values.get("LLM_CONNECT_TIMEOUT", str(min(30, timeout))))
         retries = int(values.get("LLM_RETRIES", "2"))
         retry_backoff_seconds = float(values.get("LLM_RETRY_BACKOFF_SECONDS", "2"))
         glm_key = values.get("GLM_API_KEY") or values.get("ANTHROPIC_AUTH_TOKEN")
         glm_model = values.get("GLM_MODEL") or values.get("LLM_MODEL") or "GLM-4.7"
         anthropic_url = values.get("GLM_ANTHROPIC_URL") or values.get("ANTHROPIC_BASE_URL")
         if anthropic_url and glm_key:
-            return cls(anthropic_url, glm_key, glm_model, timeout=timeout, provider="anthropic", retries=retries, retry_backoff_seconds=retry_backoff_seconds)
+            return cls(
+                anthropic_url,
+                glm_key,
+                glm_model,
+                timeout=timeout,
+                provider="anthropic",
+                retries=retries,
+                retry_backoff_seconds=retry_backoff_seconds,
+                connect_timeout=connect_timeout,
+            )
 
         glm_base_url = values.get("GLM_BASE_URL")
         if glm_base_url and glm_key and glm_model:
-            return cls(glm_base_url, glm_key, glm_model, timeout=timeout, provider="openai", retries=retries, retry_backoff_seconds=retry_backoff_seconds)
+            return cls(
+                glm_base_url,
+                glm_key,
+                glm_model,
+                timeout=timeout,
+                provider="openai",
+                retries=retries,
+                retry_backoff_seconds=retry_backoff_seconds,
+                connect_timeout=connect_timeout,
+            )
 
         llm_base_url = values.get("LLM_BASE_URL", "")
         llm_key = values.get("LLM_API_KEY")
@@ -88,7 +113,16 @@ class LLMClient:
         allow_siliconflow = values.get("LLM_ALLOW_SILICONFLOW_FALLBACK") == "1"
         if llm_base_url and llm_key and llm_model and allow_generic:
             if "siliconflow.cn" not in llm_base_url or allow_siliconflow:
-                return cls(llm_base_url, llm_key, llm_model, timeout=timeout, provider="openai", retries=retries, retry_backoff_seconds=retry_backoff_seconds)
+                return cls(
+                    llm_base_url,
+                    llm_key,
+                    llm_model,
+                    timeout=timeout,
+                    provider="openai",
+                    retries=retries,
+                    retry_backoff_seconds=retry_backoff_seconds,
+                    connect_timeout=connect_timeout,
+                )
         return None
 
     @property
@@ -108,6 +142,7 @@ class LLMClient:
                     "attempts": attempt,
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "timeout_seconds": self.timeout,
+                    "connect_timeout_seconds": self.connect_timeout,
                 }
                 return result
             except Exception as exc:
@@ -118,6 +153,7 @@ class LLMClient:
                     "attempt": attempt,
                     "attempts": attempt,
                     "timeout_seconds": self.timeout,
+                    "connect_timeout_seconds": self.connect_timeout,
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "error": str(exc),
                 }
@@ -164,24 +200,23 @@ class LLMClient:
                 }
             ],
         }
-        request = Request(
-            f"{self.base_url}/v1/messages",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM request failed: HTTP {exc.code}: {body[:1000]}") from exc
-        except URLError as exc:
+            data = self._post_json(
+                f"{self.base_url}/v1/messages",
+                payload,
+                {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+            )
+        except requests.HTTPError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else "unknown"
+            body = response.text[:1000] if response is not None else str(exc)
+            raise RuntimeError(f"LLM request failed: HTTP {status}: {body}") from exc
+        except requests.RequestException as exc:
             raise RuntimeError(f"LLM request failed: {exc}") from exc
 
         self.last_metadata = {
@@ -204,19 +239,21 @@ class LLMClient:
         }
         if use_response_format:
             payload["response_format"] = {"type": "json_object"}
-        request = Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM request failed: HTTP {exc.code}: {body[:1000]}") from exc
-        except URLError as exc:
+            data = self._post_json(
+                f"{self.base_url}/chat/completions",
+                payload,
+                {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+        except requests.HTTPError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else "unknown"
+            body = response.text[:1000] if response is not None else str(exc)
+            raise RuntimeError(f"LLM request failed: HTTP {status}: {body}") from exc
+        except requests.RequestException as exc:
             raise RuntimeError(f"LLM request failed: {exc}") from exc
 
         self.last_metadata = {
@@ -227,13 +264,79 @@ class LLMClient:
         content = data["choices"][0]["message"]["content"]
         return parse_json_object(content)
 
+    def _post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+        if shutil.which("curl"):
+            return self._post_json_curl(url, payload, headers)
+        response = requests.post(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            timeout=(self.connect_timeout, self.timeout),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _post_json_curl(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="llm-payload-", suffix=".json", delete=False) as payload_file:
+            payload_path = Path(payload_file.name)
+            payload_file.write(json.dumps(payload, ensure_ascii=False))
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="llm-curl-", suffix=".conf", delete=False) as config_file:
+            config_path = Path(config_file.name)
+            config_file.write(f'url = "{url}"\n')
+            config_file.write('request = "POST"\n')
+            config_file.write("silent\n")
+            config_file.write("show-error\n")
+            config_file.write("location\n")
+            config_file.write(f'connect-timeout = "{self.connect_timeout}"\n')
+            config_file.write(f'max-time = "{self.timeout}"\n')
+            config_file.write(f'data-binary = "@{payload_path}"\n')
+            for key, value in headers.items():
+                config_file.write(f'header = "{key}: {value}"\n')
+            config_file.write('write-out = "\\n%{http_code}"\n')
+        try:
+            result = subprocess.run(
+                ["curl", "--config", str(config_path)],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout + self.connect_timeout + 5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"LLM request failed: curl subprocess timed out after {exc.timeout}s") from exc
+        finally:
+            payload_path.unlink(missing_ok=True)
+            config_path.unlink(missing_ok=True)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"LLM request failed: curl exit {result.returncode}: {detail[:1000]}")
+        body, separator, status_text = result.stdout.rpartition("\n")
+        if not separator:
+            raise RuntimeError(f"LLM request failed: curl response missing HTTP status: {result.stdout[:1000]}")
+        try:
+            status_code = int(status_text.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"LLM request failed: invalid HTTP status from curl: {status_text!r}") from exc
+        if status_code >= 400:
+            raise RuntimeError(f"LLM request failed: HTTP {status_code}: {body[:1000]}")
+        return json.loads(body)
+
 
 def _anthropic_user_blocks(user: str) -> list[dict[str, Any]]:
     marker = next(
-        (item for item in ("Source chunks:\n", "Source index context packs:\n", "Lesson batch ") if item in user),
+        (
+            item
+            for item in (
+                "Source chunks:\n",
+                "Source index context packs:\n",
+                "Lesson batch ",
+                "Units:\n",
+                "Logic graph:\n",
+            )
+            if item in user
+        ),
         "",
     )
-    if marker not in user:
+    if not marker:
         return [{"type": "text", "text": user, "cache_control": {"type": "ephemeral"}}]
     before, source_chunks = user.split(marker, 1)
     blocks: list[dict[str, Any]] = []

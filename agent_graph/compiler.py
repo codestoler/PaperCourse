@@ -274,7 +274,7 @@ def compile_course(
     write_runtime_status(
         course_dir(Path(vault_root), final_state["course_id"]),
         {
-            "state": "done" if final_state.get("next_action") == "done" and not final_state.get("errors") else "blocked",
+            "state": _final_runtime_state(final_state),
             "next_action": final_state.get("next_action", ""),
             "error_count": len(final_state.get("errors", [])),
             "updated_at": utc_now_iso(),
@@ -387,7 +387,7 @@ def compile_plan_gate(state: CourseCompileState, vault_root: Path | str = "cours
     """Synthesize, review, and revise the compile plan inside one bounded gate."""
 
     profile = state.get("compile_profile", {})
-    max_revisions = int(profile.get("compile_plan_max_revisions", 2))
+    max_revisions = int(profile.get("compile_plan_max_revisions", 4))
     max_iterations = max(1, int(profile.get("compile_plan_gate_max_iterations", max_revisions + 3)))
     next_step = state.get("next_action") or "synthesize_compile_plan"
     if next_step != "revise_compile_plan":
@@ -401,7 +401,7 @@ def compile_plan_gate(state: CourseCompileState, vault_root: Path | str = "cours
         if next_step == "revise_compile_plan":
             state = _run_internal_step("revise_compile_plan", revise_compile_plan, state, vault_root)
             next_step = state.get("next_action", "")
-            if _needs_human_review(state) or next_step == "generate_lessons":
+            if _needs_human_review(state) or next_step in {"generate_lessons", "synthesize_lesson_bodies"}:
                 return state
         if next_step in {"review_compile_plan_llm", "synthesize_compile_plan"}:
             if next_step == "synthesize_compile_plan":
@@ -567,6 +567,12 @@ def _wrap_export_stage(vault_root: str | Path, version: str):
 
 def _needs_human_review(state: CourseCompileState) -> bool:
     return state.get("next_action") in {"human_review", "blocked_for_human_review"}
+
+
+def _final_runtime_state(state: CourseCompileState) -> str:
+    if state.get("next_action") == "done" and bool(state.get("validation_report", {}).get("ok", False)):
+        return "done"
+    return "blocked"
 
 
 def _mark_human_review_required(state: CourseCompileState, node: str, message: str) -> None:

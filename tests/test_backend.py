@@ -9,7 +9,9 @@ from unittest.mock import patch
 from backend.server import (
     course_management_payload,
     create_course_project,
+    confirm_project_preflight_plan,
     delete_lesson_entry,
+    generate_project_preflight_plan,
     list_course_projects,
     list_courses,
     list_library_files,
@@ -145,7 +147,46 @@ class BackendTests(unittest.TestCase):
             self.assertTrue(Path(context["source_files"][0]["path"]).exists())
             self.assertIn("formula_handling", context["compile_requirements"])
             self.assertNotIn("path", loaded)
+            self.assertEqual(loaded["status"], "not_started")
             self.assertFalse((root / "projects" / project["id"] / "source.md").exists())
+
+    def test_project_preflight_plan_and_confirmation_snapshot(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = store_library_upload(root, "first.md", BytesIO(b"# First\n\nGrounded text one."))
+            second = store_library_upload(root, "second.md", BytesIO(b"# Second\n\nGrounded text two."))
+            project = create_course_project(
+                root,
+                {
+                    "title": "Confirmed Course",
+                    "library_file_ids": [first["id"], second["id"]],
+                    "compile_requirements": {"exercise_ratio": "每节 2 个检查项。"},
+                },
+            )
+
+            with self.assertRaises(ValueError):
+                start_project_compile_job(root, project["id"], {})
+
+            preflight = generate_project_preflight_plan(root, project["id"], {})
+            plan = preflight["plan"]
+            confirmed = confirm_project_preflight_plan(root, project["id"], {"plan_id": plan["id"], "selected_scheme_id": "exercise"})
+            snapshot = confirmed["confirmed_compile_snapshot"]
+            loaded = read_course_project(root, project["id"])
+
+            self.assertEqual(preflight["project"]["status"], "awaiting_confirmation")
+            self.assertEqual(plan["source_scope"]["library_file_ids"], [first["id"], second["id"]])
+            self.assertEqual(plan["compile_requirements"]["exercise_ratio"], "每节 2 个检查项。")
+            self.assertEqual(snapshot["selected_scheme_id"], "exercise")
+            self.assertEqual(snapshot["plan_signature"], plan["signature"])
+            self.assertEqual(loaded["status"], "not_started")
+            self.assertIn("confirmed_compile_snapshot", loaded)
+
+            updated = update_course_project(root, project["id"], {"library_file_ids": [first["id"]]})
+            self.assertNotIn("confirmed_compile_snapshot", updated)
+            with self.assertRaises(ValueError):
+                start_project_compile_job(root, project["id"], {})
 
     def test_project_compile_job_blocks_unparsed_pdf(self) -> None:
         import tempfile
@@ -154,13 +195,17 @@ class BackendTests(unittest.TestCase):
             root = Path(tmp)
             record = store_library_upload(root, "source.pdf", BytesIO(b"%PDF-1.4\n"))
             project = create_course_project(root, {"title": "PDF Course", "library_file_ids": [record["id"]]})
+            plan = generate_project_preflight_plan(root, project["id"], {})["plan"]
+            confirm_project_preflight_plan(root, project["id"], {"plan_id": plan["id"], "selected_scheme_id": "systematic"})
 
             job = start_project_compile_job(root, project["id"], {})
             loaded = read_job_status(root, str(job["id"]))
+            project_after = read_course_project(root, project["id"])
 
             self.assertEqual(job["state"], "blocked")
             self.assertIn("MinerU", job["error"])
             self.assertEqual(loaded["events"][-1]["status"], "blocked")
+            self.assertEqual(project_after["status"], "failed")
 
     def test_project_compile_job_queues_markdown_without_running_in_test(self) -> None:
         import tempfile
@@ -177,6 +222,8 @@ class BackendTests(unittest.TestCase):
             root = Path(tmp)
             record = store_library_upload(root, "source.md", BytesIO(b"# Topic\n\nGrounded text."))
             project = create_course_project(root, {"title": "Markdown Course", "library_file_ids": [record["id"]]})
+            plan = generate_project_preflight_plan(root, project["id"], {})["plan"]
+            confirm_project_preflight_plan(root, project["id"], {"plan_id": plan["id"], "selected_scheme_id": "quick_review"})
 
             with patch("backend.server.threading.Thread", FakeThread):
                 job = start_project_compile_job(root, project["id"], {})
@@ -186,10 +233,14 @@ class BackendTests(unittest.TestCase):
             compile_context = json.loads((root / "jobs" / job["id"] / "compile_context.json").read_text(encoding="utf-8"))
 
             self.assertEqual(job["state"], "queued")
+            self.assertEqual(job["confirmed_plan_id"], plan["id"])
+            self.assertEqual(job["selected_scheme_id"], "quick_review")
             self.assertEqual(jobs[0]["id"], job["id"])
             self.assertEqual(loaded["state"], "queued")
             self.assertIn("course_structure", compile_context["compile_requirements"])
             self.assertEqual(compile_context["source_files"][0]["id"], record["id"])
+            self.assertEqual(compile_context["confirmed_compile_snapshot"]["selected_scheme_id"], "quick_review")
+            self.assertIn("--compile-context", json.loads((root / "jobs" / job["id"] / "job.json").read_text(encoding="utf-8"))["command"])
 
 
 if __name__ == "__main__":

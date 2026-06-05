@@ -14,6 +14,7 @@ class LLMClientTests(unittest.TestCase):
                 "GLM_ANTHROPIC_URL": "https://open.bigmodel.cn/api/anthropic",
                 "GLM_API_KEY": "glm-key",
                 "GLM_MODEL": "GLM-4.7",
+                "LLM_CONNECT_TIMEOUT": "12",
                 "LLM_BASE_URL": "https://api.siliconflow.cn/v1",
                 "LLM_API_KEY": "llm-key",
                 "LLM_MODEL": "other-model",
@@ -25,6 +26,7 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(client.provider, "anthropic")
         self.assertEqual(client.base_url, "https://open.bigmodel.cn/api/anthropic")
         self.assertEqual(client.model, "GLM-4.7")
+        self.assertEqual(client.connect_timeout, 12)
 
     def test_siliconflow_is_not_implicit_fallback(self) -> None:
         with patch(
@@ -46,6 +48,17 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(blocks[0]["type"], "text")
         self.assertIn("cache_control", blocks[1])
         self.assertTrue(blocks[1]["text"].startswith("Source chunks:\n"))
+
+    def test_anthropic_blocks_cache_units_without_empty_separator(self) -> None:
+        blocks = _anthropic_user_blocks("Return JSON.\n\nUnits:\n[{\"id\":\"unit-001\"}]")
+
+        self.assertEqual(blocks[0]["text"], "Return JSON.")
+        self.assertEqual(blocks[1]["text"], "Units:\n[{\"id\":\"unit-001\"}]")
+        self.assertIn("cache_control", blocks[1])
+
+        fallback = _anthropic_user_blocks("Return JSON without a cache marker.")
+        self.assertEqual(len(fallback), 1)
+        self.assertEqual(fallback[0]["text"], "Return JSON without a cache marker.")
 
     def test_parse_json_repairs_raw_latex_backslashes(self) -> None:
         parsed = parse_json_object(r'{"body_markdown":"公式 \langle x,y \rangle = \Phi(x) + \theta"}')
@@ -72,27 +85,40 @@ class LLMClientTests(unittest.TestCase):
         class FakeResponse:
             def __init__(self, body: str) -> None:
                 self.body = body
+                self.text = body
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb) -> None:
+            def raise_for_status(self) -> None:
                 return None
 
-            def read(self) -> bytes:
-                return self.body.encode("utf-8")
+            def json(self) -> dict:
+                import json
+
+                return json.loads(self.body)
 
         responses = [
             FakeResponse('{"choices":[{"message":{"content":"not json"}}]}'),
             FakeResponse('{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}'),
         ]
 
-        with patch("agent_graph.llm.urlopen", side_effect=responses):
-            client = LLMClient("https://example.test/v1", "key", "model", retries=1, retry_backoff_seconds=0)
+        with patch("agent_graph.llm.shutil.which", return_value=None), patch("agent_graph.llm.requests.post", side_effect=responses) as post:
+            client = LLMClient("https://example.test/v1", "key", "model", timeout=300, connect_timeout=9, retries=1, retry_backoff_seconds=0)
             result = client.complete_json("system", "user")
 
         self.assertTrue(result["ok"])
         self.assertEqual(client.last_metadata["attempts"], 2)
+        self.assertEqual(post.call_args.kwargs["timeout"], (9, 300))
+
+    def test_complete_json_curl_uses_config_file_for_headers(self) -> None:
+        completed = __import__("subprocess").CompletedProcess(["curl"], 0, '{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}\n200', "")
+        with patch("agent_graph.llm.shutil.which", return_value="/usr/bin/curl"), patch("agent_graph.llm.subprocess.run", return_value=completed) as run:
+            client = LLMClient("https://example.test/v1", "secret-key", "model", timeout=300, connect_timeout=9, retries=0)
+            result = client.complete_json("system", "user")
+
+        self.assertTrue(result["ok"])
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "curl")
+        self.assertNotIn("secret-key", " ".join(command))
+        self.assertEqual(run.call_args.kwargs["timeout"], 314)
 
 
 if __name__ == "__main__":

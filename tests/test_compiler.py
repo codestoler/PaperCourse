@@ -6,11 +6,12 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_graph.compiler import compile_course, compile_graph_edge_specs, compile_graph_node_specs
+from agent_graph.compiler import _final_runtime_state, compile_course, compile_graph_edge_specs, compile_graph_node_specs, compile_plan_gate
 from agent_graph.feedback import apply_approved_patches, approve_patch, mine_feedback, record_feedback
 from agent_graph.nodes import (
     _find_cached_lesson_body_by_id,
     _markdown_syntax_diagnostics,
+    _normalize_gap_report,
     _plain_markdown_text,
     _repair_course_plan_coverage,
     _source_index_for_prompt,
@@ -19,6 +20,7 @@ from agent_graph.nodes import (
     check_quality_rules,
     repair_course,
     revise_compile_plan,
+    synthesize_compile_plan,
     synthesize_lesson_bodies,
 )
 from agent_graph.state import CompileConfig, initial_state
@@ -80,6 +82,39 @@ class CompilerTests(unittest.TestCase):
         self.assertIn(("validation_repair_loop", "export_pipeline"), {(edge.source, edge.target) for edge in edges})
         self.assertNotIn("parse_sources", nodes)
         self.assertNotIn("check_markdown_syntax", nodes)
+
+    def test_final_runtime_state_allows_nonfatal_errors_after_valid_export(self) -> None:
+        state = {
+            "next_action": "done",
+            "validation_report": {"ok": True},
+            "errors": [{"node": "synthesize_lesson_bodies", "message": "Transient LLM retry failed for one draft."}],
+        }
+
+        self.assertEqual(_final_runtime_state(state), "done")
+        self.assertEqual(_final_runtime_state({"next_action": "human_review", "validation_report": {"ok": False}}), "blocked")
+
+    def test_gap_report_demotes_conceptual_duplicate_without_exact_title_match(self) -> None:
+        state = initial_state(CompileConfig(course_id="gap-normalize", source_files=[]))
+        state["units"] = [
+            {"id": "unit-001", "title": "函数逼近与插值概论", "summary": "介绍函数逼近和插值的基本框架。"},
+            {"id": "unit-002", "title": "函数逼近基本概念与函数空间", "summary": "介绍函数空间、范数和内积等概念。"},
+        ]
+        raw = {
+            "items": [
+                {
+                    "unit_id": "unit-002",
+                    "type": "duplicate_title",
+                    "severity": "high",
+                    "message": "Conceptually overlaps with unit-001.",
+                }
+            ]
+        }
+
+        report = _normalize_gap_report(raw, state)
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["items"][0]["type"], "over_split_fragment")
+        self.assertEqual(report["items"][0]["severity"], "medium")
 
     def test_markdown_syntax_diagnostics_are_structured(self) -> None:
         diagnostics, metadata = _markdown_syntax_diagnostics("##Broken heading\n\n[text]()\n\n```\ncode")
@@ -221,6 +256,165 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(checked["compile_plan_review"]["issues"][0]["type"], "needs_finer_split")
             self.assertTrue((vault / "courses" / "dense-preflight" / "lesson_body_revision_request.json").exists())
 
+    def test_lesson_body_preflight_splits_before_prompt_limit_is_exceeded(self) -> None:
+        class NoCallClient:
+            def complete_json(self, system: str, user: str) -> dict:
+                raise AssertionError("oversized prompt should be split before body generation")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            state = initial_state(
+                CompileConfig(
+                    course_id="prompt-limit-preflight",
+                    source_files=[],
+                    profile={
+                        "use_llm_lesson_bodies": True,
+                        "llm_prompt_char_limit": 15000,
+                        "lesson_body_context_limit_chars": 24000,
+                        "lesson_body_chunk_chars": 20000,
+                        "lesson_body_max_source_chunks": 20,
+                        "lesson_body_max_formula_count": 9999,
+                    },
+                )
+            )
+            state["parsed_chunks"] = [{"id": "chunk-1", "title": "Topic", "content": "source paragraph " * 1300}]
+            state["units"] = [{"id": "unit-1", "title": "Topic", "source_chunk_ids": ["chunk-1"]}]
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Topic",
+                    "unit_ids": ["unit-1"],
+                    "body": "draft",
+                    "body_max_chars": 7200,
+                    "checklist": ["draft"],
+                    "sources": [{"chunk_id": "chunk-1", "block_id": "chunk-1", "quote": "quote"}],
+                    "order": 1,
+                }
+            ]
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=NoCallClient()):
+                checked = synthesize_lesson_bodies(state, vault)
+
+            request = checked["lesson_body_revision_request"]
+            self.assertEqual(checked["next_action"], "revise_compile_plan")
+            self.assertIn("single_call_context_too_large", request["issues"][0]["reasons"])
+            self.assertGreater(request["issues"][0]["metrics"]["prompt_chars"], 15000)
+            self.assertEqual(request["issues"][0]["metrics"]["context_limit"], 15000)
+
+    def test_lesson_body_preflight_allows_compact_formula_dense_math_lesson(self) -> None:
+        class BodyClient:
+            provider = "anthropic"
+            base_url = "https://open.bigmodel.cn/api/anthropic"
+            model = "GLM-4.7"
+            cache_identity = {"provider": provider, "base_url": base_url, "model": model}
+            last_metadata = {}
+
+            def cache_key(self, system: str, user: str) -> str:
+                return f"formula-body-{len(user)}"
+
+            def complete_json(self, system: str, user: str) -> dict:
+                return {
+                    "body_markdown": "## Formula Topic\n\nA compact source-backed derivation.",
+                    "checklist": ["Explain the formula"],
+                    "covered_source_chunk_ids": ["chunk-1"],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            state = initial_state(
+                CompileConfig(
+                    course_id="formula-compact",
+                    source_files=[],
+                    profile={"use_llm_lesson_bodies": True, "refresh_lesson_bodies": True, "lesson_body_max_formula_count": 2},
+                )
+            )
+            formula_text = " ".join(["$x_i = a_i + b_i$"] * 8)
+            state["parsed_chunks"] = [{"id": "chunk-1", "title": "Formula Topic", "content": formula_text}]
+            state["units"] = [{"id": "unit-1", "title": "Formula Topic", "source_chunk_ids": ["chunk-1"]}]
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Formula Topic",
+                    "unit_ids": ["unit-1"],
+                    "body": "draft",
+                    "body_max_chars": 7200,
+                    "checklist": ["draft"],
+                    "sources": [{"chunk_id": "chunk-1", "block_id": "chunk-1", "quote": formula_text}],
+                    "order": 1,
+                }
+            ]
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=BodyClient()):
+                checked = synthesize_lesson_bodies(state, vault)
+
+            self.assertEqual(checked["next_action"], "check_markdown_syntax")
+            self.assertFalse(checked["lesson_body_revision_request"])
+            self.assertEqual(checked["lesson_bodies"]["lesson_bodies"][0]["covered_source_chunk_ids"], ["chunk-1"])
+
+    def test_lesson_body_preflight_ignores_stale_compile_plan_density_reason(self) -> None:
+        class BodyClient:
+            provider = "anthropic"
+            base_url = "https://open.bigmodel.cn/api/anthropic"
+            model = "GLM-4.7"
+            cache_identity = {"provider": provider, "base_url": base_url, "model": model}
+            last_metadata = {}
+
+            def cache_key(self, system: str, user: str) -> str:
+                return f"body-{len(user)}"
+
+            def complete_json(self, system: str, user: str) -> dict:
+                return {
+                    "body_markdown": "## Topic\n\nA source-backed explanation.",
+                    "checklist": ["Read the source"],
+                    "covered_source_chunk_ids": ["chunk-1"],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            state = initial_state(
+                CompileConfig(
+                    course_id="stale-density",
+                    source_files=[],
+                    profile={"use_llm_lesson_bodies": True, "refresh_lesson_bodies": True},
+                )
+            )
+            state["parsed_chunks"] = [{"id": "chunk-1", "title": "Topic", "content": "source paragraph"}]
+            state["units"] = [{"id": "unit-1", "title": "Topic", "source_chunk_ids": ["chunk-1"]}]
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Topic",
+                    "unit_ids": ["unit-1"],
+                    "body": "draft",
+                    "body_max_chars": 7200,
+                    "checklist": ["draft"],
+                    "sources": [{"chunk_id": "chunk-1", "block_id": "chunk-1", "quote": "source paragraph"}],
+                    "order": 1,
+                }
+            ]
+            state["compile_plan"] = {
+                "hierarchy": {
+                    "lessons": [
+                        {
+                            "lesson_id": "lesson-001",
+                            "body_density_estimate": {
+                                "estimated_plain_chars": 1200,
+                                "plain_limit": 5000,
+                                "needs_finer_split": True,
+                                "reasons": ["knowledge_points_too_many"],
+                            },
+                        }
+                    ]
+                }
+            }
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=BodyClient()):
+                checked = synthesize_lesson_bodies(state, vault)
+
+            self.assertEqual(checked["next_action"], "check_markdown_syntax")
+            self.assertFalse(checked["lesson_body_revision_request"])
+            self.assertEqual(checked["lesson_bodies"]["lesson_bodies"][0]["covered_source_chunk_ids"], ["chunk-1"])
+
     def test_revise_compile_plan_splits_needs_finer_split_lesson_by_units(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             vault = Path(tmp) / "course-vault"
@@ -256,6 +450,53 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual([lesson["id"] for lesson in revised["lessons"]], ["lesson-001", "lesson-002"])
             self.assertEqual([lesson["title"] for lesson in revised["lessons"]], ["Alpha", "Beta"])
             self.assertEqual(revised["compile_plan_revisions"][0]["actions"][0]["action"], "split_lesson")
+
+    def test_revise_compile_plan_splits_body_preflight_after_review_revision_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            state = initial_state(CompileConfig(course_id="split-after-limit", source_files=[], profile={"compile_plan_max_revisions": 4}))
+            state["compile_plan_revisions"] = [{"attempt": index + 1} for index in range(4)]
+            state["units"] = [
+                {"id": "unit-1", "title": "Alpha", "section_title": "S", "lesson_type": "concept", "content_type": "source_supported", "source": "source.md", "source_chunk_id": "chunk-1", "source_quote": "alpha", "source_refs": [{"chunk_id": "chunk-1", "source": "source.md", "quote": "alpha"}]},
+                {"id": "unit-2", "title": "Beta", "section_title": "S", "lesson_type": "concept", "content_type": "source_supported", "source": "source.md", "source_chunk_id": "chunk-2", "source_quote": "beta", "source_refs": [{"chunk_id": "chunk-2", "source": "source.md", "quote": "beta"}]},
+            ]
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Alpha Beta",
+                    "section_title": "S",
+                    "lesson_type": "concept",
+                    "unit_ids": ["unit-1", "unit-2"],
+                    "body": "combined",
+                    "body_max_chars": 7200,
+                    "checklist": ["combined"],
+                    "sources": [{"chunk_id": "chunk-1", "quote": "alpha"}, {"chunk_id": "chunk-2", "quote": "beta"}],
+                    "images": [],
+                    "order": 1,
+                }
+            ]
+            state["compile_plan_review"] = {
+                "passed": False,
+                "issues": [
+                    {
+                        "type": "needs_finer_split",
+                        "severity": "high",
+                        "lesson_ids": ["lesson-001"],
+                        "message": "body preflight split",
+                        "needs_finer_split": True,
+                        "stage": "pre_generation",
+                    }
+                ],
+                "revise_prompt": {"actions": ["split_lesson"]},
+            }
+
+            revised = revise_compile_plan(state, vault)
+
+            self.assertEqual(revised["next_action"], "synthesize_lesson_bodies")
+            self.assertEqual([lesson["id"] for lesson in revised["lessons"]], ["lesson-001", "lesson-002"])
+            self.assertEqual(revised["compile_plan_revisions"][-1]["revision_stage"], "lesson_body_finer_split_after_review_limit")
+            revision_log = json.loads((vault / "courses" / "split-after-limit" / "compile_plan_revision_log.json").read_text(encoding="utf-8"))
+            self.assertEqual(revision_log["status"], "lesson_body_finer_split_after_review_limit")
 
     def test_revise_compile_plan_falls_back_to_generate_lessons_when_split_is_unreliable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,7 +603,7 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(request["stage"], "post_generation")
             self.assertIn("generated_lesson_plain_text_exceeds_limit", request["issues"][0]["reasons"])
 
-    def test_lesson_body_batch_generation_limit_requests_finer_split(self) -> None:
+    def test_lesson_body_generation_allows_course_total_over_batch_limit(self) -> None:
         class BatchBodyClient:
             def __init__(self) -> None:
                 self.calls = 0
@@ -393,8 +634,9 @@ class CompilerTests(unittest.TestCase):
                 checked = synthesize_lesson_bodies(state, vault)
 
             self.assertEqual(client.calls, 2)
-            self.assertEqual(checked["next_action"], "revise_compile_plan")
-            self.assertIn("generated_batch_plain_text_exceeds_limit", checked["lesson_body_revision_request"]["issues"][0]["reasons"])
+            self.assertEqual(checked["next_action"], "check_markdown_syntax")
+            self.assertFalse(checked["lesson_body_revision_request"])
+            self.assertEqual(len(checked["lesson_bodies"]["lesson_bodies"]), 2)
 
     def test_compile_markdown_exports_versioned_lessons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -598,6 +840,62 @@ class CompilerTests(unittest.TestCase):
             self.assertFalse(review["passed"])
             self.assertEqual(review["revise_prompt"]["actions"], ["flag_manual_confirmation"])
 
+    def test_compile_plan_gate_exits_when_revision_limit_allows_advisory_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            state = initial_state(
+                CompileConfig(
+                    course_id="advisory-course",
+                    source_files=[],
+                    profile={"compile_plan_max_revisions": 4},
+                )
+            )
+            state["next_action"] = "revise_compile_plan"
+            state["compile_plan_revisions"] = [{"attempt": index + 1} for index in range(4)]
+            state["compile_plan_review"] = {
+                "passed": False,
+                "issues": [
+                    {
+                        "type": "source_gap",
+                        "severity": "high",
+                        "message": "LLM advisory source assignment concern.",
+                        "lesson_ids": ["lesson-001"],
+                        "unit_ids": [],
+                    }
+                ],
+                "local_metadata": {"mode": "local_rule_review"},
+            }
+
+            state = compile_plan_gate(state, vault)
+
+            self.assertEqual(state["next_action"], "synthesize_lesson_bodies")
+            self.assertFalse(state["errors"])
+            self.assertEqual(_internal_nodes(state), ["compile_plan_gate_iteration", "revise_compile_plan"])
+
+    def test_synthesize_compile_plan_resets_revision_count_for_new_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            state = initial_state(CompileConfig(course_id="new-plan", source_files=[]))
+            state["compile_plan_revisions"] = [{"attempt": index + 1} for index in range(8)]
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Topic",
+                    "section_title": "S",
+                    "lesson_type": "concept",
+                    "unit_ids": ["unit-1"],
+                    "body": "source-backed draft",
+                    "sources": [{"chunk_id": "chunk-1", "quote": "source"}],
+                    "order": 1,
+                }
+            ]
+
+            state = synthesize_compile_plan(state, vault)
+
+            self.assertEqual(state["next_action"], "review_compile_plan_llm")
+            self.assertEqual(state["compile_plan_revisions"], [])
+            self.assertTrue((vault / "courses" / "new-plan" / "compile_plan.json").exists())
+
     def test_llm_structure_nodes_filter_fragments_and_preserve_provenance(self) -> None:
         class StructureClient:
             calls: list[str] = []
@@ -717,6 +1015,94 @@ class CompilerTests(unittest.TestCase):
             self.assertNotIn("organize_logic", _internal_nodes(state))
             self.assertTrue((course_path / "extract_units_emergency_fallback.json").exists())
             self.assertTrue((course_path / "human_review.json").exists())
+
+    def test_extract_units_splits_prompts_before_llm_submit_when_over_limit(self) -> None:
+        class SplittingClient:
+            last_metadata = {"usage": {"input_tokens": 1}}
+            cache_identity = {"provider": "fake", "model": "split"}
+
+            def __init__(self) -> None:
+                self.prompt_lengths: list[int] = []
+                self.extract_calls = 0
+
+            def complete_json(self, system: str, user: str):
+                self.prompt_lengths.append(len(system) + len(user))
+                joined = system + "\n" + user
+                if _is_compile_plan_review_prompt(system, user):
+                    return _passing_compile_plan_review()
+                if _is_validation_prompt(system, user):
+                    return _passing_validation_result()
+                if "structure-extraction agent" in joined:
+                    self.extract_calls += 1
+                    chunk_ids = [
+                        line.split(":", 1)[1].strip()
+                        for line in user.splitlines()
+                        if line.startswith("- id:")
+                    ]
+                    return {
+                        "units": [
+                            {
+                                "title": f"Split Unit {self.extract_calls}",
+                                "section_title": "Split Section",
+                                "lesson_type": "concept",
+                                "summary": "A split, source-backed unit.",
+                                "source_chunk_ids": chunk_ids,
+                            }
+                        ]
+                    }
+                if "logic-organization agent" in joined:
+                    return {"nodes": [], "edges": []}
+                if "gap-detection agent" in joined:
+                    return {"items": []}
+                if "lesson-drafting agent" in joined:
+                    unit_ids = [
+                        line.split('"', 3)[3]
+                        for line in user.splitlines()
+                        if '"id": "unit-' in line
+                    ]
+                    if not unit_ids:
+                        unit_ids = ["unit-001"]
+                    return {
+                        "lessons": [
+                            {
+                                "title": f"Lesson {index}",
+                                "section_title": "Split Section",
+                                "lesson_type": "concept",
+                                "unit_ids": [unit_id],
+                                "body": "Source-grounded draft.",
+                                "checklist": ["Review source evidence"],
+                            }
+                            for index, unit_id in enumerate(unit_ids, start=1)
+                        ]
+                    }
+                raise AssertionError(f"Unexpected LLM prompt: {joined[:200]}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.md"
+            source.write_text(
+                "\n\n".join(
+                    f"# Topic {index}\n\n" + ("Detailed source explanation with numerical method context. " * 28)
+                    for index in range(1, 18)
+                ),
+                encoding="utf-8",
+            )
+            vault = root / "course-vault"
+            client = SplittingClient()
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=client):
+                state = compile_course(
+                    [str(source)],
+                    "split-structure-course",
+                    vault,
+                    "v1",
+                    profile={"use_llm_structure": True, "llm_prompt_char_limit": 9000},
+                )
+
+            self.assertEqual(state["next_action"], "done")
+            self.assertGreater(client.extract_calls, 1)
+            self.assertTrue(client.prompt_lengths)
+            self.assertLessEqual(max(client.prompt_lengths), 9000)
 
     def test_image_understanding_places_figures_and_pending_confirmations(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
@@ -1368,6 +1754,57 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("\\begin{array}{cc}", body)
         self.assertEqual(checked["next_action"], "export_version")
 
+    def test_quality_rules_preserve_single_line_display_math(self) -> None:
+        state = initial_state(CompileConfig(course_id="single-line-display", source_files=[]))
+        source = {"chunk_id": "chunk-1", "block_id": "chunk-1", "page": 1, "bbox": [0, 0, 1, 1], "quote": "Hermite"}
+        state["lessons"] = [
+            {
+                "id": "lesson-001",
+                "title": "Hermite",
+                "unit_ids": ["unit-001"],
+                "body": (
+                    "## Hermite\n\n"
+                    "$$H_{2n+1}(x) = \\sum_{j=0}^{n} f_j \\alpha_j(x)$$\n\n"
+                    "- $\\alpha_j(x_i) = \\begin{cases} 1, & i = j \\\\ 0, & i \\neq j \\end{cases}$\n"
+                ),
+                "checklist": ["Read"],
+                "sources": [source],
+                "order": 1,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checked = check_quality_rules(state, Path(tmp) / "vault")
+
+        body = checked["lessons"][0]["body"]
+        self.assertNotIn("$$\n$$H", body)
+        self.assertNotIn("formula_markdown_mix", {failure["type"] for failure in checked["validation_report"]["failures"]})
+        self.assertEqual(checked["next_action"], "export_version")
+
+    def test_quality_rules_ignore_inline_matrix_in_markdown_list(self) -> None:
+        state = initial_state(CompileConfig(course_id="inline-matrix-list", source_files=[]))
+        source = {"chunk_id": "chunk-1", "block_id": "chunk-1", "page": 1, "bbox": [0, 0, 1, 1], "quote": "condition"}
+        state["lessons"] = [
+            {
+                "id": "lesson-001",
+                "title": "Condition Number",
+                "unit_ids": ["unit-001"],
+                "body": (
+                    "## 易错点\n\n"
+                    "- 矩阵 $A = \\begin{bmatrix} 1 & 1 \\\\ 1 & 1.0001 \\end{bmatrix}$ 的条件数不能用行列式代替。\n"
+                ),
+                "checklist": ["Read"],
+                "sources": [source],
+                "order": 1,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checked = check_quality_rules(state, Path(tmp) / "vault")
+
+        self.assertNotIn("formula_markdown_mix", {failure["type"] for failure in checked["validation_report"]["failures"]})
+        self.assertEqual(checked["next_action"], "export_version")
+
     def test_validation_llm_failure_blocks_export_and_reports_location(self) -> None:
         class ValidationClient:
             def __init__(self) -> None:
@@ -1521,14 +1958,210 @@ class CompilerTests(unittest.TestCase):
             self.assertIn("markdown_before", audit["entries"][0])
             self.assertIn("markdown_after", audit["entries"][0])
 
+    def test_markdown_repair_compacts_prompt_before_llm_submit(self) -> None:
+        class CompactRepairClient:
+            def __init__(self) -> None:
+                self.prompt_lengths: list[int] = []
+
+            def complete_json(self, system: str, user: str):
+                self.prompt_lengths.append(len(system) + len(user))
+                self_test.assertLessEqual(len(system) + len(user), 15000)
+                return {
+                    "lesson_id": "lesson-001",
+                    "title": "Topic Alpha",
+                    "body_markdown": "## Topic Alpha\n\n公式 $x$ 已闭合。",
+                    "checklist": ["检查公式"],
+                    "covered_source_chunk_ids": ["source-chunk-1"],
+                    "repair_notes": "Compacted oversized prompt before repair.",
+                }
+
+        self_test = self
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            client = CompactRepairClient()
+            long_user_prompt = "Source chunks:\n" + ("长来源材料 " * 2500)
+            long_markdown = "## Topic Alpha\n\n" + ("解释 $x$，" * 900) + "\n\n最后留下 $x 未闭合"
+            state = initial_state(CompileConfig(course_id="markdown-compact", source_files=[], profile={"use_llm_lesson_bodies": True}))
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Topic Alpha",
+                    "unit_ids": [],
+                    "body": long_markdown,
+                    "checklist": ["检查公式"],
+                    "sources": [],
+                    "order": 1,
+                }
+            ]
+            state["lesson_bodies"] = {
+                "lesson_bodies": [
+                    {
+                        "lesson_id": "lesson-001",
+                        "title": "Topic Alpha",
+                        "body_markdown": long_markdown,
+                        "checklist": ["检查公式"],
+                        "covered_source_chunk_ids": ["source-chunk-1"],
+                    }
+                ]
+            }
+            state["lesson_body_inputs"] = {
+                "lessons": [
+                    {
+                        "lesson_id": "lesson-001",
+                        "system_prompt": "original system " * 500,
+                        "user_prompt": long_user_prompt,
+                        "source_chunk_ids": ["source-chunk-1"],
+                    }
+                ]
+            }
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=client):
+                state = check_markdown_syntax(state, vault)
+
+            self.assertTrue(client.prompt_lengths)
+            self.assertTrue(state["markdown_syntax_report"]["ok"])
+            self.assertEqual(state["markdown_syntax_report"]["lessons"][0]["status"], "repaired")
+
+    def test_markdown_syntax_repairs_display_math_list_markers_locally(self) -> None:
+        class UnexpectedClient:
+            def complete_json(self, system: str, user: str):
+                raise AssertionError("formula_markdown_mix should be repaired locally")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            bad_markdown = "## Topic Alpha\n\n$$\n- x + y = 0\n+ z = 1\n$$\n"
+            state = initial_state(CompileConfig(course_id="markdown-local", source_files=[], profile={"use_llm_lesson_bodies": True}))
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Topic Alpha",
+                    "unit_ids": [],
+                    "body": bad_markdown,
+                    "checklist": ["检查公式"],
+                    "sources": [],
+                    "order": 1,
+                }
+            ]
+            state["lesson_bodies"] = {
+                "lesson_bodies": [
+                    {
+                        "lesson_id": "lesson-001",
+                        "title": "Topic Alpha",
+                        "body_markdown": bad_markdown,
+                        "checklist": ["检查公式"],
+                        "covered_source_chunk_ids": ["source-chunk-1"],
+                    }
+                ]
+            }
+            state["lesson_body_inputs"] = {"lessons": []}
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=UnexpectedClient()):
+                state = check_markdown_syntax(state, vault)
+
+            self.assertTrue(state["markdown_syntax_report"]["ok"])
+            self.assertEqual(state["markdown_syntax_report"]["lessons"][0]["strategy"], "local_repair")
+            self.assertIn("{}- x", state["lessons"][0]["body"])
+            self.assertIn("{}+ z", state["lessons"][0]["body"])
+
+    def test_markdown_diagnostics_do_not_treat_single_line_display_math_as_open(self) -> None:
+        from agent_graph.nodes import _markdown_syntax_diagnostics
+
+        markdown = "## Topic Alpha\n\n$$e = x - y$$\n\n反例：\n- 方法一\n- 方法二\n"
+        diagnostics, _ = _markdown_syntax_diagnostics(markdown)
+
+        self.assertNotIn("formula_markdown_mix", {item.get("type") for item in diagnostics})
+
+    def test_markdown_syntax_repairs_odd_list_indentation_locally(self) -> None:
+        class UnexpectedClient:
+            def complete_json(self, system: str, user: str):
+                raise AssertionError("list_indentation should be repaired locally")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            bad_markdown = "## Topic Alpha\n\n- parent\n   - child\n"
+            state = initial_state(CompileConfig(course_id="markdown-list-local", source_files=[], profile={"use_llm_lesson_bodies": True}))
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Topic Alpha",
+                    "unit_ids": [],
+                    "body": bad_markdown,
+                    "checklist": ["检查列表"],
+                    "sources": [],
+                    "order": 1,
+                }
+            ]
+            state["lesson_bodies"] = {
+                "lesson_bodies": [
+                    {
+                        "lesson_id": "lesson-001",
+                        "title": "Topic Alpha",
+                        "body_markdown": bad_markdown,
+                        "checklist": ["检查列表"],
+                        "covered_source_chunk_ids": ["source-chunk-1"],
+                    }
+                ]
+            }
+            state["lesson_body_inputs"] = {"lessons": []}
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=UnexpectedClient()):
+                state = check_markdown_syntax(state, vault)
+
+            self.assertTrue(state["markdown_syntax_report"]["ok"])
+            self.assertEqual(state["markdown_syntax_report"]["lessons"][0]["strategy"], "local_repair")
+            self.assertIn("  - child", state["lessons"][0]["body"])
+
+    def test_markdown_syntax_repairs_missing_code_fence_language_locally(self) -> None:
+        class UnexpectedClient:
+            def complete_json(self, system: str, user: str):
+                raise AssertionError("closed code fence language should be repaired locally")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp) / "course-vault"
+            bad_markdown = "## Topic Alpha\n\n```\nsample\n```\n"
+            state = initial_state(CompileConfig(course_id="markdown-fence-local", source_files=[], profile={"use_llm_lesson_bodies": True}))
+            state["lessons"] = [
+                {
+                    "id": "lesson-001",
+                    "title": "Topic Alpha",
+                    "unit_ids": [],
+                    "body": bad_markdown,
+                    "checklist": ["检查代码块"],
+                    "sources": [],
+                    "order": 1,
+                }
+            ]
+            state["lesson_bodies"] = {
+                "lesson_bodies": [
+                    {
+                        "lesson_id": "lesson-001",
+                        "title": "Topic Alpha",
+                        "body_markdown": bad_markdown,
+                        "checklist": ["检查代码块"],
+                        "covered_source_chunk_ids": ["source-chunk-1"],
+                    }
+                ]
+            }
+            state["lesson_body_inputs"] = {"lessons": []}
+
+            with patch("agent_graph.nodes.LLMClient.from_env", return_value=UnexpectedClient()):
+                state = check_markdown_syntax(state, vault)
+
+            self.assertTrue(state["markdown_syntax_report"]["ok"])
+            self.assertEqual(state["markdown_syntax_report"]["lessons"][0]["strategy"], "local_repair")
+            self.assertIn("```text", state["lessons"][0]["body"])
+
     def test_markdown_syntax_summary_agent_regenerates_after_three_failed_repairs(self) -> None:
         class FallbackRepairClient:
             def __init__(self) -> None:
                 self.repair_calls = 0
                 self.summary_calls = 0
                 self.regenerate_calls = 0
+                self.prompt_lengths: list[int] = []
 
             def complete_json(self, system: str, user: str):
+                self.prompt_lengths.append(len(system) + len(user))
+                self_test.assertLessEqual(len(system) + len(user), 15000)
                 if "markdown_repair_summary_agent" in system:
                     self.summary_calls += 1
                     return {
@@ -1563,13 +2196,15 @@ class CompilerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             vault = Path(tmp) / "course-vault"
             client = FallbackRepairClient()
+            long_user_prompt = "Source chunks:\n" + ("长来源材料 " * 2500)
+            long_bad_markdown = "## Topic Alpha\n\n" + ("公式 $x$ 解释段落。\n" * 800) + "\n最终 $x 未闭合"
             state = initial_state(CompileConfig(course_id="markdown-fallback", source_files=[], profile={"use_llm_lesson_bodies": True}))
             state["lessons"] = [
                 {
                     "id": "lesson-001",
                     "title": "Topic Alpha",
                     "unit_ids": [],
-                    "body": "## Topic Alpha\n\n公式 $x 未闭合",
+                    "body": long_bad_markdown,
                     "checklist": ["检查公式"],
                     "sources": [],
                     "order": 1,
@@ -1580,7 +2215,7 @@ class CompilerTests(unittest.TestCase):
                     {
                         "lesson_id": "lesson-001",
                         "title": "Topic Alpha",
-                        "body_markdown": "## Topic Alpha\n\n公式 $x 未闭合",
+                        "body_markdown": long_bad_markdown,
                         "checklist": ["检查公式"],
                         "covered_source_chunk_ids": ["source-chunk-1"],
                     }
@@ -1590,8 +2225,8 @@ class CompilerTests(unittest.TestCase):
                 "lessons": [
                     {
                         "lesson_id": "lesson-001",
-                        "system_prompt": "original system",
-                        "user_prompt": "original user with source chunks",
+                        "system_prompt": "original system " * 500,
+                        "user_prompt": long_user_prompt,
                         "source_chunk_ids": ["source-chunk-1"],
                     }
                 ]
@@ -1603,6 +2238,7 @@ class CompilerTests(unittest.TestCase):
             self.assertEqual(client.repair_calls, 3)
             self.assertEqual(client.summary_calls, 1)
             self.assertEqual(client.regenerate_calls, 1)
+            self.assertTrue(client.prompt_lengths)
             self.assertTrue(state["markdown_syntax_report"]["ok"])
             self.assertEqual(state["markdown_syntax_report"]["lessons"][0]["strategy"], "summary_regeneration_passed")
             audit = state["markdown_repair_audit"]
