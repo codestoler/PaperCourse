@@ -23,6 +23,27 @@ from .vision import VisionImageClient
 OCR_PARAGRAPH_MARKERS = "□■▪▫◆◇◻◼"
 
 
+def _review_feedback_for_prompt(profile: dict[str, Any], max_items: int = 5, max_chars: int = 1800) -> str:
+    feedback = profile.get("review_feedback", [])
+    if not isinstance(feedback, list) or not feedback:
+        return ""
+    lines = ["Human review feedback to honor in this rerun:"]
+    for item in feedback[-max_items:]:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action", "")).strip()
+        node = str(item.get("node", "")).strip()
+        target = str(item.get("target_node", "")).strip()
+        comment = str(item.get("feedback", "") or item.get("comment", "")).strip()
+        lines.append(f"- action={action or 'review'}; node={node or 'unknown'}; target={target or node or 'unknown'}; feedback={comment or '(no comment)'}")
+    if len(lines) == 1:
+        return ""
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[: max_chars - 20].rstrip() + "\n...[truncated]"
+    return text + "\n\n"
+
+
 def _append_external_event(state: CourseCompileState, vault_root: Path | str, stage: str, status: str, **fields: Any) -> None:
     course_path = course_dir(Path(vault_root), state["course_id"])
     event = runtime_event(stage=stage, status=status, **fields)
@@ -377,6 +398,7 @@ def plan_course(state: CourseCompileState, vault_root: Path | str = "course-vaul
     if learn_by_doing:
         system += " In learn-by-doing mode, turn software/manual reference material into a task-first tutorial path."
     user = (
+        f"{_review_feedback_for_prompt(profile)}"
         "Create a course plan JSON with this schema:\n"
         "{\"sections\":[{\"title\":\"...\",\"lessons\":[{\"title\":\"...\",\"chunk_ids\":[\"...\"],"
         "\"why\":\"...\",\"lesson_type\":\"setup|task|example|troubleshooting|reference\"}]}],\"rejected_titles\":[\"...\"]}\n\n"
@@ -5266,6 +5288,7 @@ def review_compile_plan_llm(state: CourseCompileState, vault_root: Path | str = 
             "Return strict JSON only."
         )
         user = (
+            f"{_review_feedback_for_prompt(state.get('compile_profile', {}))}"
             "Review this Markdown synthesis plan and return JSON with schema:\n"
             "{\"passed\":false,\"issues\":[{\"type\":\"granularity|short_fragment_chapter|duplicate_title|image_random_insert|"
             "visual_note_pollution|formula_markdown_risk|source_gap|other\",\"severity\":\"high|medium|low\","
@@ -6204,6 +6227,7 @@ def _lesson_body_generation_prompt(
     target_chars = min(int(profile.get("lesson_body_target_chars", 3500)), plain_limit)
     max_chars = min(int(profile.get("lesson_body_max_chars", 7200)), plain_limit)
     user = (
+        f"{_review_feedback_for_prompt(profile)}"
         "Write one detailed lesson JSON with this schema:\n"
         "{\"lesson_id\":\"lesson-001\",\"title\":\"...\",\"body_markdown\":\"...\","
         "\"checklist\":[\"...\"],\"covered_source_chunk_ids\":[\"...\"],"

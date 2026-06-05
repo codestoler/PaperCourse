@@ -220,6 +220,38 @@ button.active {
   font-size: 13px;
 }
 
+.parse-progress-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 220px) max-content;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.parse-progress-row progress {
+  width: 100%;
+}
+
+.parse-usage,
+.parse-error {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.parse-usage.ready {
+  color: #166534;
+}
+
+.parse-usage.pending {
+  color: #475569;
+}
+
+.parse-error {
+  color: #991b1b;
+}
+
 .resource-meta,
 .resource-actions {
   display: flex;
@@ -261,6 +293,35 @@ button.active {
   font-size: 12px;
 }
 
+.block-table {
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.block-table div {
+  padding: 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.block-table p {
+  margin: 5px 0 0;
+  color: #374151;
+}
+
+.parse-log {
+  max-height: 280px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 6px;
+  background: #111827;
+  color: #e5e7eb;
+  white-space: pre-wrap;
+}
+
 .project-form select {
   min-height: 78px;
 }
@@ -288,6 +349,11 @@ button.active {
   background: #f8fafc;
   color: #374151;
   font-size: 13px;
+}
+
+.selected-source small {
+  color: #64748b;
+  font-size: 12px;
 }
 
 .selected-source button {
@@ -367,16 +433,30 @@ button.active {
 .status-running,
 .status-queued,
 .status-analyzing,
-.status-compiling {
+.status-compiling,
+.status-waiting_parse,
+.status-parsing,
+.status-waiting_review,
+.status-paused,
+.status-terminating {
   background: #dbeafe;
   color: #1e3a8a;
 }
 
 .status-failed,
 .status-blocked,
-.status-awaiting_confirmation {
+.status-awaiting_confirmation,
+.status-parse_failed,
+.status-terminated {
   background: #fee2e2;
   color: #991b1b;
+}
+
+.status-parsed,
+.status-success,
+.status-warning {
+  background: #dcfce7;
+  color: #14532d;
 }
 
 .project-state {
@@ -402,6 +482,130 @@ button.active {
   grid-column: 1 / -1;
   color: #697386;
   overflow-wrap: anywhere;
+}
+
+.job-control-panel {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.job-control-panel button,
+.job-control-panel select {
+  width: auto;
+}
+
+.job-control-panel label {
+  display: grid;
+  gap: 4px;
+  min-width: 180px;
+  color: #5b6472;
+  font-size: 12px;
+}
+
+.job-results-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.job-results-header,
+.job-review-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.job-results-header h3,
+.job-node-detail h3,
+.job-node-detail h4 {
+  margin: 0;
+}
+
+.job-results-header span {
+  color: #5b6472;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.job-node-list {
+  display: grid;
+  gap: 6px;
+}
+
+.job-node-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) max-content max-content;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+
+.job-node-row small,
+.artifact-preview span {
+  color: #5b6472;
+  font-size: 12px;
+}
+
+.job-review-panel,
+.job-node-detail {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.job-review-panel textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.job-review-panel label {
+  display: grid;
+  gap: 4px;
+  color: #5b6472;
+  font-size: 12px;
+}
+
+.artifact-preview {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+}
+
+.artifact-preview div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.artifact-preview pre,
+.node-errors pre {
+  max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
 }
 
 .preflight-panel {

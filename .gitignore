@@ -8,5 +8,8 @@ node_modules/
 .playwright-browsers/
 course-vault/courses
 course-vault/parsed
+course-vault/library
+course-vault/jobs
+course-vault/parse-jobs
 user_feedback/
 logs/

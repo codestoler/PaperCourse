@@ -31,9 +31,13 @@ const progress = hasDocument ? document.querySelector("#progress") : null;
 
 let courses = [];
 let libraryFiles = [];
+let openLibraryReports = new Set();
+let libraryAnalysisReports = {};
 let courseProjects = [];
 let projectJobs = {};
 let projectPreflightPlans = {};
+let projectJobNodes = {};
+let projectJobNodeDetails = {};
 let editingProjectId = "";
 let currentCourse = null;
 let currentCourseSummary = null;
@@ -49,7 +53,7 @@ let projectJobPollTimer = 0;
 let libraryPollTimer = 0;
 
 async function loadCourses() {
-  const [data] = await Promise.all([fetch("/api/courses").then((response) => response.json()), loadLibraryFiles(), loadProjects()]);
+  const [data] = await Promise.all([fetchCourseList(), loadLibraryFiles(), loadProjects()]);
   courses = data.courses.sort((a, b) => {
     if (a.id === "numerical-analysis") return -1;
     if (b.id === "numerical-analysis") return 1;
@@ -68,6 +72,17 @@ async function loadCourses() {
   showDashboard();
 }
 
+async function fetchCourseList() {
+  const response = await fetch("/api/courses");
+  if (response.status === 404) {
+    return { courses: [] };
+  }
+  if (!response.ok) {
+    throw new Error(`课程列表读取失败: ${response.status}`);
+  }
+  return response.json();
+}
+
 async function loadLibraryFiles() {
   if (!libraryFileList) {
     return;
@@ -77,6 +92,7 @@ async function loadLibraryFiles() {
   renderLibraryFiles();
   renderProjectFileOptions();
   scheduleLibraryPolling();
+  await refreshOpenLibraryReports();
 }
 
 async function loadProjects() {
@@ -112,23 +128,7 @@ function renderLibraryFiles() {
     libraryFileList.innerHTML = `<p class="muted">暂无资料。上传后会自动进入资料分析。</p>`;
     return;
   }
-  libraryFileList.innerHTML = libraryFiles.map((file) => `
-    <article class="resource-item">
-      <div>
-        <strong>${escapeHtml(file.filename || file.id)}</strong>
-        <span>${escapeHtml(file.id || "")}</span>
-        <span>${escapeHtml(file.parsed_source_path || "尚无 parsed 输入")}</span>
-      </div>
-      <div class="resource-meta">
-        <span class="status-pill status-${escapeAttr(file.parse_status || file.analysis_status || "unknown")}">${escapeHtml(parseStatusLabel(file.parse_status || file.analysis_status || "unknown"))}</span>
-        <span>${formatBytes(file.size || 0)}</span>
-      </div>
-      <div class="resource-actions">
-        <button type="button" data-library-report="${escapeAttr(file.id)}">查看解析结果</button>
-        <button type="button" data-library-reparse="${escapeAttr(file.id)}">重新解析</button>
-      </div>
-    </article>
-  `).join("");
+  libraryFileList.innerHTML = libraryFiles.map((file) => renderLibraryFileItem(file, libraryAnalysisReports[file.id])).join("");
   libraryFileList.querySelectorAll("[data-library-report]").forEach((button) => {
     button.addEventListener("click", () => showAnalysisReport(button.dataset.libraryReport));
   });
@@ -137,21 +137,110 @@ function renderLibraryFiles() {
   });
 }
 
+function renderLibraryFileItem(file, report = null, reportOpenOverride = null) {
+  const status = file.parse_status || file.analysis_status || "unknown";
+  const progressValue = parseProgressValue(file);
+  const isParsing = ["waiting_parse", "parsing"].includes(status);
+  const canCompile = Boolean(file.can_compile || (status === "parsed" && file.parsed_source_path));
+  const usageText = canCompile ? "可用于课程生成" : status === "parse_failed" ? "解析失败，需重新解析后使用" : "解析完成后可用于课程生成";
+  const reportOpen = reportOpenOverride === null ? openLibraryReports.has(file.id) : Boolean(reportOpenOverride);
+  return `
+    <article class="resource-item">
+      <div>
+        <strong>${escapeHtml(file.filename || file.id)}</strong>
+        <span>${escapeHtml(file.id || "")}</span>
+        <span>${escapeHtml(file.parsed_source_path || "尚无 parsed 输入")}</span>
+        <div class="parse-progress-row">
+          <progress value="${progressValue}" max="100"></progress>
+          <span>${progressValue}% · ${escapeHtml(parseStageLabel(file.parse_current_stage || status))}</span>
+        </div>
+        <small class="parse-usage ${canCompile ? "ready" : "pending"}">${escapeHtml(usageText)}</small>
+        ${file.parse_error ? `<small class="parse-error">${escapeHtml(file.parse_error)}</small>` : ""}
+      </div>
+      <div class="resource-meta">
+        <span class="status-pill status-${escapeAttr(status)}">${escapeHtml(parseStatusLabel(status))}</span>
+        <span>${formatBytes(file.size || 0)}</span>
+      </div>
+      <div class="resource-actions">
+        <button type="button" data-library-report="${escapeAttr(file.id)}">${reportOpen ? "收起解析结果" : "查看解析结果"}</button>
+        <button type="button" data-library-reparse="${escapeAttr(file.id)}"${isParsing ? " disabled" : ""}>重新解析</button>
+      </div>
+      ${reportOpen ? `<div class="analysis-report">${report ? renderAnalysisReport(report) : `<p class="muted">正在读取解析报告...</p>`}</div>` : ""}
+    </article>
+  `;
+}
+
+function parseProgressValue(file) {
+  const status = file.parse_status || file.analysis_status || "unknown";
+  if (status === "parsed" || status === "parse_failed") {
+    return 100;
+  }
+  const raw = Number(file.parse_progress || 0);
+  if (raw > 0) {
+    return Math.max(0, Math.min(99, Math.round(raw)));
+  }
+  return status === "parsing" ? 10 : 0;
+}
+
+function parseStageLabel(stage) {
+  return {
+    waiting_parse: "等待解析",
+    local_parse: "本地解析",
+    mineru_parse: "MinerU 解析",
+    mineru_poll: "等待 MinerU 返回",
+    parsing: "解析中",
+    parsed: "解析完成",
+    parse_failed: "解析失败",
+  }[stage] || stage || "未知阶段";
+}
+
 async function showAnalysisReport(fileId) {
-  const report = await fetch(`/api/library/files/${encodeURIComponent(fileId)}/analysis`).then((response) => response.json());
-  const target = libraryFileList.querySelector(`[data-library-report="${cssEscape(fileId)}"]`)?.closest(".resource-item");
-  if (!target) {
+  if (openLibraryReports.has(fileId)) {
+    openLibraryReports.delete(fileId);
+    renderLibraryFiles();
     return;
   }
-  const existing = target.querySelector(".analysis-report");
-  if (existing) {
-    existing.remove();
+  openLibraryReports.add(fileId);
+  renderLibraryFiles();
+  await fetchLibraryAnalysisReport(fileId);
+  renderLibraryFiles();
+}
+
+async function refreshOpenLibraryReports() {
+  const pending = [...openLibraryReports].filter((fileId) => {
+    if (libraryAnalysisReports[fileId]) {
+      return false;
+    }
+    const file = libraryFiles.find((item) => item.id === fileId);
+    const status = file?.parse_status || file?.analysis_status || "";
+    return file && !["waiting_parse", "parsing"].includes(status);
+  });
+  if (!pending.length) {
     return;
   }
-  const panel = document.createElement("div");
-  panel.className = "analysis-report";
-  panel.innerHTML = renderAnalysisReport(report);
-  target.appendChild(panel);
+  await Promise.all(pending.map((fileId) => fetchLibraryAnalysisReport(fileId)));
+  renderLibraryFiles();
+}
+
+async function fetchLibraryAnalysisReport(fileId) {
+  try {
+    const response = await fetch(`/api/library/files/${encodeURIComponent(fileId)}/analysis`);
+    if (!response.ok) {
+      libraryAnalysisReports[fileId] = {
+        parse_status: "parse_failed",
+        potential_problems: [{ severity: "high", message: `读取解析报告失败: ${response.status}` }],
+        parse_logs: [],
+      };
+    } else {
+      libraryAnalysisReports[fileId] = await response.json();
+    }
+  } catch (error) {
+    libraryAnalysisReports[fileId] = {
+      parse_status: "parse_failed",
+      potential_problems: [{ severity: "high", message: `读取解析报告失败: ${error}` }],
+      parse_logs: [],
+    };
+  }
 }
 
 function renderAnalysisReport(report) {
@@ -209,6 +298,8 @@ async function reparseLibraryFile(fileId) {
     window.alert(`启动解析失败: ${response.status}`);
     return;
   }
+  delete libraryAnalysisReports[fileId];
+  openLibraryReports.add(fileId);
   await loadLibraryFiles();
 }
 
@@ -218,7 +309,7 @@ function renderProjectFileOptions() {
   }
   const selected = new Set([...projectFiles.selectedOptions].map((option) => option.value));
   projectFiles.innerHTML = libraryFiles.map((file) => (
-    `<option value="${escapeAttr(file.id)}"${selected.has(file.id) ? " selected" : ""}>${escapeHtml(file.filename || file.id)}</option>`
+    `<option value="${escapeAttr(file.id)}"${selected.has(file.id) ? " selected" : ""}>${escapeHtml(file.filename || file.id)} · ${escapeHtml(parseStatusLabel(file.parse_status || file.analysis_status || "unknown"))}${file.can_compile ? " · 可用" : ""}</option>`
   )).join("");
   renderProjectSelectedFiles();
 }
@@ -238,6 +329,7 @@ function renderProjectSelectedFiles() {
   projectSelectedFiles.innerHTML = selected.map((file) => `
     <span class="selected-source">
       ${escapeHtml(file.filename || file.id)}
+      <small>${escapeHtml(parseStatusLabel(file.parse_status || file.analysis_status || "unknown"))}${file.can_compile ? " · 可用于课程生成" : ""}</small>
       <button type="button" aria-label="移除资料 ${escapeAttr(file.filename || file.id)}" data-remove-project-file="${escapeAttr(file.id)}">×</button>
     </span>
   `).join("");
@@ -275,6 +367,7 @@ function renderProjects() {
         <button type="button" data-project-compile="${escapeAttr(project.id)}"${!projectCanCompile(project) ? " disabled" : ""}>按确认方案编译</button>
       </div>
       ${renderProjectJobControlPanel(project)}
+      ${renderProjectJobIntermediatePanel(project)}
       ${renderProjectPreflightPanel(project)}
     </article>
   `).join("");
@@ -292,6 +385,15 @@ function renderProjects() {
   });
   projectList.querySelectorAll("[data-job-control]").forEach((button) => {
     button.addEventListener("click", () => controlProjectJob(button));
+  });
+  projectList.querySelectorAll("[data-job-nodes-load]").forEach((button) => {
+    button.addEventListener("click", () => loadProjectJobNodes(button.dataset.jobNodesLoad));
+  });
+  projectList.querySelectorAll("[data-job-node-select]").forEach((button) => {
+    button.addEventListener("click", () => loadProjectJobNodeDetail(button.dataset.jobId, button.dataset.jobNodeSelect));
+  });
+  projectList.querySelectorAll("[data-job-review]").forEach((button) => {
+    button.addEventListener("click", () => submitProjectJobReview(button));
   });
   scheduleProjectJobPolling();
 }
@@ -315,6 +417,7 @@ function renderProjectJobStatus(project) {
     done: "编译完成",
     failed: "编译失败",
     blocked: "需要预处理",
+    waiting_review: "待人工审核",
   }[latest.state] || latest.state || "unknown";
   const detail = latest.error || latest.current_stage || latest.version || "";
   return `
@@ -334,8 +437,8 @@ function renderProjectJobControlPanel(project) {
   }
   const canPause = latest.state === "running";
   const canResume = latest.state === "paused";
-  const canTerminate = ["running", "paused", "queued"].includes(latest.state);
-  const canRerun = ["done", "failed", "blocked", "terminated"].includes(latest.state);
+  const canTerminate = ["running", "paused", "queued", "waiting_review"].includes(latest.state);
+  const canRerun = ["done", "failed", "blocked", "terminated", "waiting_review"].includes(latest.state);
   const node = latest.current_stage || "synthesize_lesson_bodies";
   return `
     <div class="job-control-panel">
@@ -355,15 +458,125 @@ function renderProjectJobControlPanel(project) {
   `;
 }
 
+function renderProjectJobIntermediatePanel(project) {
+  const latest = (projectJobs[project.id] || [])[0];
+  if (!latest) {
+    return "";
+  }
+  const nodes = projectJobNodes[latest.id] || latest.nodes || [];
+  const detail = projectJobNodeDetails[latest.id] || null;
+  return renderJobIntermediatePanel(latest, nodes, detail);
+}
+
+function renderJobIntermediatePanel(job, nodes = [], detail = null) {
+  const nodeRows = (nodes || []).map((node) => `
+    <button type="button" class="job-node-row" data-job-id="${escapeAttr(job.id)}" data-job-node-select="${escapeAttr(node.node || "")}">
+      <span>${escapeHtml(node.node || "")}</span>
+      <span class="status-pill status-${escapeAttr(node.status || "pending")}">${escapeHtml(nodeStatusLabel(node.status || "pending"))}</span>
+      <small>${Number(node.output_count || 0)} 输出 · ${Number(node.error_count || 0)} 错误</small>
+    </button>
+  `).join("");
+  return `
+    <div class="job-results-panel">
+      <div class="job-results-header">
+        <div>
+          <h3>编译中间结果</h3>
+          <span>${escapeHtml(job.id || "")}</span>
+        </div>
+        <button type="button" data-job-nodes-load="${escapeAttr(job.id)}">刷新节点结果</button>
+      </div>
+      ${job.state === "waiting_review" ? renderJobReviewPanel(job) : ""}
+      ${nodes.length ? `<div class="job-node-list">${nodeRows}</div>` : `<p class="muted">点击刷新节点结果查看 source brief、图片理解、课程计划、正文、Markdown 检查和质量检查。</p>`}
+      ${detail ? renderJobNodeDetail(detail) : ""}
+    </div>
+  `;
+}
+
+function renderJobReviewPanel(job) {
+  return `
+    <div class="job-review-panel">
+      <strong>流程已阻塞在人工审核</strong>
+      <textarea data-review-feedback="${escapeAttr(job.id)}" rows="3" placeholder="填写修改意见，后续 agent 会读取这段反馈。"></textarea>
+      <label>
+        <span>目标节点</span>
+        <select data-review-target="${escapeAttr(job.id)}">
+          ${compileNodeOptions(job.current_stage || "human_review")}
+        </select>
+      </label>
+      <div class="job-review-actions">
+        <button type="button" data-job-review="approve" data-job-id="${escapeAttr(job.id)}">通过</button>
+        <button type="button" data-job-review="request-modification" data-job-id="${escapeAttr(job.id)}">要求修改</button>
+        <button type="button" data-job-review="rerun" data-job-id="${escapeAttr(job.id)}">重跑</button>
+        <button type="button" data-job-review="rollback" data-job-id="${escapeAttr(job.id)}">回退</button>
+        <button type="button" data-job-review="skip" data-job-id="${escapeAttr(job.id)}">跳过</button>
+        <button type="button" data-job-control="terminate" data-job-id="${escapeAttr(job.id)}">终止</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderJobNodeDetail(detail) {
+  const artifacts = (label, items) => `
+    <section>
+      <h4>${escapeHtml(label)}</h4>
+      ${(items || []).map((item) => `
+        <article class="artifact-preview">
+          <div><strong>${escapeHtml(item.name || "")}</strong><span>${item.exists ? `${Number(item.size || 0).toLocaleString("zh-CN")} bytes` : "未生成"}</span></div>
+          ${item.exists ? `<pre>${escapeHtml(formatArtifactPreview(item.preview))}</pre>` : ""}
+        </article>
+      `).join("") || `<p class="muted">无记录</p>`}
+    </section>
+  `;
+  return `
+    <div class="job-node-detail">
+      <h3>${escapeHtml(detail.node || "")}</h3>
+      <p><span class="status-pill status-${escapeAttr(detail.status || "pending")}">${escapeHtml(nodeStatusLabel(detail.status || "pending"))}</span></p>
+      ${detail.errors?.length ? `<div class="node-errors"><strong>错误</strong><pre>${escapeHtml(JSON.stringify(detail.errors, null, 2))}</pre></div>` : ""}
+      ${artifacts("输入", detail.inputs)}
+      ${artifacts("输出", detail.outputs)}
+      ${detail.review && Object.keys(detail.review).length ? artifacts("人工审核", [{ name: "human_review.json", exists: true, preview: detail.review }]) : ""}
+      ${detail.review_decisions?.length ? artifacts("审核决策", [{ name: "review_decisions.jsonl", exists: true, preview: detail.review_decisions }]) : ""}
+    </div>
+  `;
+}
+
+function formatArtifactPreview(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+function nodeStatusLabel(state) {
+  return {
+    pending: "待运行",
+    running: "运行中",
+    paused: "已暂停",
+    terminating: "终止中",
+    finished: "已完成",
+    failed: "失败",
+    waiting_review: "待人工审核",
+  }[state] || state || "未知";
+}
+
 function compileNodeOptions(selected) {
   const nodes = [
+    "parse_sources",
+    "understand_images",
     "build_source_index",
     "synthesize_source_brief",
     "plan_course",
     "synthesize_lesson_notes",
+    "generate_lessons",
+    "synthesize_compile_plan",
+    "review_compile_plan_llm",
+    "revise_compile_plan",
     "synthesize_lesson_bodies",
     "check_markdown_syntax",
+    "check_grounding_rules",
     "check_quality_rules",
+    "repair_course",
+    "human_review",
     "export_version",
   ];
   return nodes.map((node) => `<option value="${escapeAttr(node)}"${node === selected ? " selected" : ""}>${escapeHtml(node)}</option>`).join("");
@@ -391,12 +604,67 @@ async function controlProjectJob(button) {
   await loadProjects();
 }
 
+async function loadProjectJobNodes(jobId) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/nodes`);
+  if (!response.ok) {
+    window.alert(`读取节点结果失败: ${response.status}`);
+    return;
+  }
+  const data = await response.json();
+  projectJobNodes[jobId] = data.nodes || [];
+  renderProjects();
+}
+
+async function loadProjectJobNodeDetail(jobId, node) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/nodes/${encodeURIComponent(node)}`);
+  if (!response.ok) {
+    window.alert(`读取节点详情失败: ${response.status}`);
+    return;
+  }
+  projectJobNodeDetails[jobId] = await response.json();
+  if (!projectJobNodes[jobId]) {
+    await loadProjectJobNodes(jobId);
+    return;
+  }
+  renderProjects();
+}
+
+async function submitProjectJobReview(button) {
+  const action = button.dataset.jobReview;
+  const jobId = button.dataset.jobId;
+  const feedback = projectList.querySelector(`[data-review-feedback="${cssEscape(jobId)}"]`)?.value || "";
+  const targetNode = projectList.querySelector(`[data-review-target="${cssEscape(jobId)}"]`)?.value || "";
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/review/${encodeURIComponent(action)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ feedback, target_node: targetNode }),
+  });
+  if (!response.ok) {
+    window.alert(`提交审核操作失败: ${response.status}`);
+    return;
+  }
+  projectJobNodes[jobId] = [];
+  projectJobNodeDetails[jobId] = null;
+  await loadProjects();
+}
+
 function projectHasRunningJob(projectId) {
   return (projectJobs[projectId] || []).some((job) => ["queued", "running", "paused", "terminating"].includes(job.state));
 }
 
+function projectSourcesReady(project) {
+  const ids = project?.library_file_ids || [];
+  if (!ids.length) {
+    return false;
+  }
+  return ids.every((id) => {
+    const file = libraryFiles.find((item) => item.id === id);
+    return Boolean(file?.can_compile || (file?.parse_status === "parsed" && file?.parsed_source_path));
+  });
+}
+
 function projectCanCompile(project) {
-  return Boolean(project?.confirmed_compile_snapshot?.plan_id) && !projectHasRunningJob(project.id);
+  return Boolean(project?.confirmed_compile_snapshot?.plan_id) && projectSourcesReady(project) && !projectHasRunningJob(project.id);
 }
 
 function renderProjectPreflightPanel(project) {
@@ -1104,6 +1372,7 @@ function projectStatusLabel(state) {
     analyzing: "分析中",
     awaiting_confirmation: "待确认",
     compiling: "编译中",
+    waiting_review: "待人工审核",
     succeeded: "成功",
     failed: "失败",
   }[state] || "状态未知";
@@ -1591,10 +1860,18 @@ if (typeof module !== "undefined") {
     formatRequirements,
     normalizeLatexBlock,
     parseRequirements,
+    parseStatusLabel,
+    parseProgressValue,
+    parseStageLabel,
     preprocessMarkdown,
     parseReadingKey,
     projectStatusLabel,
     readingKey,
+    renderAnalysisReport,
+    renderLibraryFileItem,
+    renderJobIntermediatePanel,
+    renderJobNodeDetail,
+    renderProjectJobStatus,
     renderMarkdown,
     stripMarkdownListMarker,
     withSavedReadingPosition,

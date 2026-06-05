@@ -163,19 +163,157 @@ class FrontendRendererTests(unittest.TestCase):
     def test_project_status_labels_cover_compile_flow(self) -> None:
         data = self.run_node_json(
             """
-            const { projectStatusLabel } = require('./frontend/app.js');
-            const states = ['not_started', 'queued', 'analyzing', 'awaiting_confirmation', 'compiling', 'succeeded', 'failed'];
-            process.stdout.write(JSON.stringify(Object.fromEntries(states.map((state) => [state, projectStatusLabel(state)]))));
+            const { parseStatusLabel, projectStatusLabel } = require('./frontend/app.js');
+            const states = ['not_started', 'queued', 'analyzing', 'awaiting_confirmation', 'compiling', 'waiting_review', 'succeeded', 'failed'];
+            const parseStates = ['waiting_parse', 'parsing', 'parsed', 'parse_failed'];
+            process.stdout.write(JSON.stringify({
+              projects: Object.fromEntries(states.map((state) => [state, projectStatusLabel(state)])),
+              parse: Object.fromEntries(parseStates.map((state) => [state, parseStatusLabel(state)]))
+            }));
             """
         )
 
-        self.assertEqual(data["not_started"], "未开始")
-        self.assertEqual(data["queued"], "排队中")
-        self.assertEqual(data["analyzing"], "分析中")
-        self.assertEqual(data["awaiting_confirmation"], "待确认")
-        self.assertEqual(data["compiling"], "编译中")
-        self.assertEqual(data["succeeded"], "成功")
-        self.assertEqual(data["failed"], "失败")
+        self.assertEqual(data["projects"]["not_started"], "未开始")
+        self.assertEqual(data["projects"]["queued"], "排队中")
+        self.assertEqual(data["projects"]["analyzing"], "分析中")
+        self.assertEqual(data["projects"]["awaiting_confirmation"], "待确认")
+        self.assertEqual(data["projects"]["compiling"], "编译中")
+        self.assertEqual(data["projects"]["waiting_review"], "待人工审核")
+        self.assertEqual(data["projects"]["succeeded"], "成功")
+        self.assertEqual(data["projects"]["failed"], "失败")
+        self.assertEqual(data["parse"]["waiting_parse"], "等待解析")
+        self.assertEqual(data["parse"]["parsing"], "解析中")
+        self.assertEqual(data["parse"]["parsed"], "解析完成")
+        self.assertEqual(data["parse"]["parse_failed"], "解析失败")
+
+    def test_job_intermediate_panel_renders_nodes_and_review_controls(self) -> None:
+        html = self.run_node_json(
+            """
+            const { renderJobIntermediatePanel } = require('./frontend/app.js');
+            const html = renderJobIntermediatePanel(
+              { id: 'job-1', state: 'waiting_review', current_stage: 'human_review' },
+              [
+                { node: 'synthesize_source_brief', status: 'finished', output_count: 2, error_count: 0 },
+                { node: 'check_markdown_syntax', status: 'failed', output_count: 1, error_count: 1 },
+                { node: 'check_quality_rules', status: 'finished', output_count: 1, error_count: 0 }
+              ],
+              {
+                node: 'synthesize_source_brief',
+                status: 'finished',
+                inputs: [{ name: 'source_index.json', exists: true, size: 12, preview: { pack_count: 3 } }],
+                outputs: [{ name: 'source_brief.json', exists: true, size: 20, preview: { summary: 'brief' } }],
+                errors: [],
+                review: { reason: 'needs review' },
+                review_decisions: [{ action: 'request-modification', feedback: 'split' }]
+              }
+            );
+            process.stdout.write(JSON.stringify(html));
+            """
+        )
+
+        self.assertIn("编译中间结果", html)
+        self.assertIn("synthesize_source_brief", html)
+        self.assertIn("check_markdown_syntax", html)
+        self.assertIn("流程已阻塞在人工审核", html)
+        self.assertIn("data-job-review=\"approve\"", html)
+        self.assertIn("data-job-review=\"request-modification\"", html)
+        self.assertIn("data-job-control=\"terminate\"", html)
+        self.assertIn("source_brief.json", html)
+        self.assertIn("review_decisions.jsonl", html)
+
+    def test_analysis_report_renders_parse_artifacts(self) -> None:
+        html = self.run_node_json(
+            """
+            const { renderAnalysisReport } = require('./frontend/app.js');
+            const html = renderAnalysisReport({
+              status: 'success',
+              parse_status: 'parsed',
+              chapter_structure: [{title: 'Chapter', line: 1}],
+              knowledge_points: [{name: 'Definition'}],
+              text_blocks: [{page: 3, line: 12, title: 'Chapter', type: 'formula', text: '$$x+y$$'}],
+              formulas: [{line: 12, type: 'display_math', preview: '$$x+y$$'}],
+              images: [{line: 14, type: 'markdown_image', path: 'img.png'}],
+              tables: [{line: 16, type: 'markdown_table', status: 'recognized'}],
+              parse_logs: ['mineru: done'],
+              potential_problems: []
+            });
+            process.stdout.write(JSON.stringify({html}));
+            """
+        )["html"]
+
+        self.assertIn("解析完成", html)
+        self.assertIn("p.3", html)
+        self.assertIn("display_math", html)
+        self.assertIn("img.png", html)
+        self.assertIn("markdown_table", html)
+        self.assertIn("mineru: done", html)
+
+    def test_library_file_item_renders_parse_progress_and_keeps_report_open(self) -> None:
+        html = self.run_node_json(
+            """
+            const { renderLibraryFileItem } = require('./frontend/app.js');
+            const html = renderLibraryFileItem(
+              {
+                id: 'file-1',
+                filename: 'source.pdf',
+                size: 1200,
+                parse_status: 'parsing',
+                parse_progress: 45,
+                parse_current_stage: 'mineru_poll',
+                parsed_source_path: '',
+                can_compile: false
+              },
+              { parse_status: 'parse_failed', potential_problems: [{ severity: 'high', message: 'MinerU failed' }], parse_logs: ['failed'] },
+              true
+            );
+            process.stdout.write(JSON.stringify(html));
+            """
+        )
+
+        self.assertIn('value="45"', html)
+        self.assertIn("等待 MinerU 返回", html)
+        self.assertIn("解析完成后可用于课程生成", html)
+        self.assertIn("收起解析结果", html)
+        self.assertIn("MinerU failed", html)
+
+    def test_library_file_item_marks_parsed_file_ready_for_compile(self) -> None:
+        html = self.run_node_json(
+            """
+            const { renderLibraryFileItem } = require('./frontend/app.js');
+            const html = renderLibraryFileItem(
+              {
+                id: 'file-1',
+                filename: 'source.md',
+                size: 1200,
+                parse_status: 'parsed',
+                parse_progress: 100,
+                parse_current_stage: 'parsed',
+                parsed_source_path: 'parsed/library/source/content.md',
+                can_compile: true
+              },
+              null,
+              false
+            );
+            process.stdout.write(JSON.stringify(html));
+            """
+        )
+
+        self.assertIn("可用于课程生成", html)
+        self.assertIn('value="100"', html)
+
+    def test_project_job_status_renders_control_states_from_backend_job(self) -> None:
+        html = self.run_node_json(
+            """
+            const { renderProjectJobStatus } = require('./frontend/app.js');
+            global.projectJobs = undefined;
+            const project = {id: 'p1'};
+            const app = require('./frontend/app.js');
+            // renderProjectJobStatus closes over module state, so expose via an eval-friendly projectJobs update.
+            process.stdout.write(JSON.stringify({html: renderProjectJobStatus(project)}));
+            """
+        )["html"]
+
+        self.assertIn("暂无编译任务", html)
 
 
 if __name__ == "__main__":

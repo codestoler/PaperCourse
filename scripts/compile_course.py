@@ -138,6 +138,7 @@ def main() -> int:
         profile["project_compile_context_path"] = str(context_path)
         profile["confirmed_library_file_ids"] = list(snapshot.get("library_file_ids", [])) if isinstance(snapshot, dict) else []
         profile["user_compile_requirements"] = dict(snapshot.get("compile_requirements", {})) if isinstance(snapshot, dict) else {}
+        profile["review_feedback"] = list(context.get("review_feedback", [])) if isinstance(context, dict) else []
         profile["selected_compile_scheme"] = scheme
         profile["confirmed_preflight_plan_id"] = str(snapshot.get("plan_id", "")) if isinstance(snapshot, dict) else ""
         profile["confirmed_preflight_plan_signature"] = str(snapshot.get("plan_signature", "")) if isinstance(snapshot, dict) else ""

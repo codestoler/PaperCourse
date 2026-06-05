@@ -10,6 +10,7 @@ from agent_graph.compiler import _final_runtime_state, compile_course, compile_g
 from agent_graph.feedback import apply_approved_patches, approve_patch, mine_feedback, record_feedback
 from agent_graph.nodes import (
     _find_cached_lesson_body_by_id,
+    _lesson_body_generation_prompt,
     _markdown_syntax_diagnostics,
     _normalize_gap_report,
     _plain_markdown_text,
@@ -53,6 +54,29 @@ def _graph_nodes(state: dict) -> list[str]:
 
 def _internal_nodes(state: dict) -> list[str]:
     return [item["node"] for item in state["internal_run_log"]]
+
+
+class ReviewFeedbackPromptTests(unittest.TestCase):
+    def test_review_feedback_is_included_in_lesson_body_prompt(self) -> None:
+        profile = {
+            "review_feedback": [
+                {
+                    "action": "request-modification",
+                    "node": "human_review",
+                    "target_node": "synthesize_lesson_bodies",
+                    "feedback": "请拆分过长课时并保留源码引用。",
+                }
+            ]
+        }
+        lesson = {"id": "lesson-001", "title": "Topic", "lesson_type": "concept", "section_title": "Section", "body": "draft"}
+        chunks = {"chunk-1": {"id": "chunk-1", "title": "Chunk", "content": "source evidence"}}
+
+        _system, user = _lesson_body_generation_prompt(lesson, profile, False, ["chunk-1"], chunks)
+
+        self.assertIn("Human review feedback", user)
+        self.assertIn("请拆分过长课时", user)
+        self.assertIn("Source chunks", user)
+        self.assertIn("source evidence", user)
 
 
 class CompilerTests(unittest.TestCase):

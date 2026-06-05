@@ -97,9 +97,16 @@ class CourseRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json(update_course_project(VAULT_ROOT, parts[2], payload))
             elif method == "GET" and len(parts) == 3 and parts[:2] == ["api", "jobs"]:
                 self._send_json(read_job_status(VAULT_ROOT, parts[2]))
+            elif method == "GET" and len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "nodes":
+                self._send_json({"nodes": list_job_node_results(VAULT_ROOT, parts[2])})
+            elif method == "GET" and len(parts) == 5 and parts[:2] == ["api", "jobs"] and parts[3] == "nodes":
+                self._send_json(read_job_node_result(VAULT_ROOT, parts[2], parts[4]))
             elif method == "POST" and len(parts) == 4 and parts[:2] == ["api", "jobs"]:
                 payload = self._read_json_body()
                 self._send_json(control_compile_job(VAULT_ROOT, parts[2], parts[3], payload))
+            elif method == "POST" and len(parts) == 5 and parts[:2] == ["api", "jobs"] and parts[3] == "review":
+                payload = self._read_json_body()
+                self._send_json(control_compile_job(VAULT_ROOT, parts[2], parts[4], payload))
             elif len(parts) >= 3 and parts[:2] == ["api", "assets"]:
                 self._send_asset(parts[2:])
             elif method == "GET" and len(parts) == 4 and parts[:2] == ["api", "courses"] and parts[3] == "versions":
@@ -184,7 +191,36 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _server_log(message: str, **fields: object) -> None:
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
+    suffix = f" {details}" if details else ""
+    print(f"[server] {message}{suffix}", flush=True)
+
+
 PARSER_REQUIRED_SUFFIXES = {".pdf", ".ppt", ".pptx", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+
+COMPILE_NODE_ARTIFACTS: dict[str, dict[str, list[str]]] = {
+    "parse_sources": {"inputs": ["compile_context.json"], "outputs": ["source_index.json", "source_index.md"]},
+    "understand_images": {"inputs": ["compile_context.json"], "outputs": ["image_understanding.json", "image_understanding.md", "formula_image_recognition.json", "formula_image_recognition.md"]},
+    "build_source_index": {"inputs": ["compile_context.json"], "outputs": ["source_index.json", "source_index.md", "source_index_meta.json"]},
+    "synthesize_source_brief": {"inputs": ["source_index.json", "source_index.md"], "outputs": ["source_brief.json", "source_brief.md", "source_brief_meta.json"]},
+    "plan_course": {"inputs": ["source_brief.json", "source_index.json"], "outputs": ["course_plan.json", "llm_call_meta.json"]},
+    "synthesize_lesson_notes": {"inputs": ["course_plan.json", "source_brief.json"], "outputs": ["lesson_notes.json", "lesson_notes.md", "lesson_notes_meta.json"]},
+    "extract_units": {"inputs": ["course_plan.json", "lesson_notes.json"], "outputs": ["units.json", "units_meta.json"]},
+    "organize_logic": {"inputs": ["units.json"], "outputs": ["logic_graph.json", "logic_graph_meta.json"]},
+    "detect_gaps": {"inputs": ["units.json", "logic_graph.json"], "outputs": ["gap_report.json", "gap_report_meta.json"]},
+    "generate_lessons": {"inputs": ["units.json", "logic_graph.json", "gap_report.json"], "outputs": ["lessons.json", "outline.json", "concepts.json", "lesson_generation_evidence.json", "lesson_evidence.json", "lessons_meta.json"]},
+    "synthesize_compile_plan": {"inputs": ["lessons.json", "outline.json"], "outputs": ["compile_plan.json", "compile_plan.md"]},
+    "review_compile_plan_llm": {"inputs": ["compile_plan.json", "compile_plan.md"], "outputs": ["compile_plan_review.json", "compile_plan_review.md"]},
+    "revise_compile_plan": {"inputs": ["compile_plan_review.json", "lesson_body_revision_request.json"], "outputs": ["compile_plan_revision_log.json", "compile_plan.json", "lessons.json", "outline.json"]},
+    "synthesize_lesson_bodies": {"inputs": ["lessons.json", "lesson_notes.json", "compile_plan.json"], "outputs": ["lesson_bodies.json", "lesson_bodies.md", "lesson_bodies_meta.json", "lesson_body_revision_request.json"]},
+    "check_markdown_syntax": {"inputs": ["lesson_bodies.json"], "outputs": ["markdown_syntax_report.json", "markdown_syntax_report.md", "markdown_repair_audit.json"]},
+    "check_grounding_rules": {"inputs": ["lessons.json", "source_index.json"], "outputs": ["validation_report.json"]},
+    "check_quality_rules": {"inputs": ["lessons.json", "markdown_syntax_report.json"], "outputs": ["validation_report.json"]},
+    "repair_course": {"inputs": ["validation_report.json"], "outputs": ["repair_report.json", "compile_patches.json", "lessons.json"]},
+    "human_review": {"inputs": ["validation_report.json", "compile_plan_review.json"], "outputs": ["human_review.json"]},
+    "export_version": {"inputs": ["lessons.json", "validation_report.json"], "outputs": ["course_meta.json", "version_record.json"]},
+}
 
 
 def store_library_upload(vault_root: Path, filename: str, stream, *, run_async: bool = False) -> dict[str, object]:
@@ -215,6 +251,7 @@ def store_library_upload(vault_root: Path, filename: str, stream, *, run_async: 
         "uploaded_at": _mtime_iso(target),
     }
     _upsert_library_record(vault_root, record)
+    _server_log("library upload stored", file_id=file_id, filename=safe_name, size=len(content))
     record = start_library_parse_task(vault_root, file_id, run_async=run_async)["file"]
     return record
 
@@ -222,7 +259,8 @@ def store_library_upload(vault_root: Path, filename: str, stream, *, run_async: 
 def list_library_files(vault_root: Path = VAULT_ROOT) -> list[dict[str, object]]:
     index = _read_json_if_exists(vault_root / "library" / "library_index.json", {"files": []})
     files = index.get("files", []) if isinstance(index, dict) else []
-    return sorted((item for item in files if isinstance(item, dict)), key=lambda item: str(item.get("uploaded_at", "")), reverse=True)
+    normalized = [_with_parse_job_summary(vault_root, _with_legacy_parse_defaults(vault_root, dict(item))) for item in files if isinstance(item, dict)]
+    return sorted(normalized, key=lambda item: str(item.get("uploaded_at", "")), reverse=True)
 
 
 def read_library_analysis(vault_root: Path, file_id: str) -> dict[str, object]:
@@ -233,7 +271,7 @@ def read_library_analysis(vault_root: Path, file_id: str) -> dict[str, object]:
 
 
 def read_library_parse_status(vault_root: Path, file_id: str) -> dict[str, object]:
-    file_record = _library_record_by_id(vault_root, file_id)
+    file_record = _with_parse_job_summary(vault_root, _library_record_by_id(vault_root, file_id))
     task_id = str(file_record.get("parse_task_id") or "")
     job = read_parse_job_status(vault_root, task_id) if task_id else {}
     return {"file": file_record, "parse_job": job}
@@ -263,6 +301,7 @@ def start_library_parse_task(vault_root: Path, file_id: str, *, run_async: bool 
     _append_job_event(job_dir, {"stage": "parse", "status": "waiting_parse", "message": "Parse task created"})
     record.update({"parse_task_id": task_id, "parse_status": "waiting_parse", "analysis_status": "waiting_parse", "updated_at": now})
     _upsert_library_record(vault_root, record)
+    _server_log("parse task queued", file_id=file_id, task_id=task_id, filename=record.get("filename", ""))
     if run_async:
         threading.Thread(target=_run_library_parse_task, args=(vault_root, task_id), daemon=True).start()
     else:
@@ -276,7 +315,55 @@ def read_parse_job_status(vault_root: Path, task_id: str) -> dict[str, object]:
     if not path.exists():
         raise FileNotFoundError(task_id)
     job = _read_json(path)
-    return {**job, "events": _read_job_events(job_dir)[-80:]}
+    events = _read_job_events(job_dir)
+    return {**_parse_job_with_event_progress(job, events), "events": events[-80:]}
+
+
+def _with_parse_job_summary(vault_root: Path, record: dict[str, object]) -> dict[str, object]:
+    task_id = str(record.get("parse_task_id") or "")
+    if task_id:
+        try:
+            job = read_parse_job_status(vault_root, task_id)
+        except FileNotFoundError:
+            job = {}
+        if job:
+            record = {
+                **record,
+                "parse_progress": int(job.get("progress") or 0),
+                "parse_current_stage": job.get("current_stage", ""),
+                "parse_error": job.get("error", ""),
+                "parse_started_at": job.get("started_at", ""),
+                "parse_finished_at": job.get("finished_at", ""),
+            }
+    status = str(record.get("parse_status") or record.get("analysis_status") or "")
+    record["can_compile"] = status == "parsed" and bool(record.get("parsed_source_path"))
+    record.setdefault("parse_progress", 100 if status in {"parsed", "parse_failed"} else 0)
+    record.setdefault("parse_current_stage", status)
+    record.setdefault("parse_error", "")
+    return record
+
+
+def _parse_job_with_event_progress(job: dict[str, object], events: list[dict[str, object]]) -> dict[str, object]:
+    job = dict(job)
+    state = str(job.get("state", ""))
+    if state == "parsing":
+        derived = int(job.get("progress") or 10)
+        latest = next((event for event in reversed(events) if event.get("stage") in {"mineru_poll", "mineru_parse", "local_parse"}), {})
+        if latest:
+            job["current_stage"] = str(latest.get("stage") or job.get("current_stage") or "parsing")
+            if latest.get("stage") == "mineru_poll":
+                states = latest.get("states", [])
+                if isinstance(states, list) and states:
+                    done = sum(1 for item in states if isinstance(item, dict) and item.get("state") in {"done", "failed"})
+                    derived = max(derived, min(95, 20 + round(done / len(states) * 70)))
+                else:
+                    derived = max(derived, 45)
+            elif latest.get("stage") == "mineru_parse":
+                derived = max(derived, 20)
+            elif latest.get("stage") == "local_parse":
+                derived = max(derived, 50)
+        job["progress"] = min(95, derived)
+    return job
 
 
 def _run_library_parse_task(vault_root: Path, task_id: str) -> None:
@@ -291,6 +378,7 @@ def _run_library_parse_task(vault_root: Path, task_id: str) -> None:
     _append_job_event(job_dir, {"stage": job["current_stage"], "status": "started", "message": "Parsing started"})
     record.update({"parse_status": "parsing", "analysis_status": "parsing", "updated_at": now})
     _upsert_library_record(vault_root, record)
+    _server_log("parse task started", file_id=file_id, task_id=task_id, stage=job["current_stage"])
     try:
         if _requires_mineru(source_path):
             parsed_markdown = _run_mineru_parse(vault_root, record, job_dir)
@@ -298,7 +386,12 @@ def _run_library_parse_task(vault_root: Path, task_id: str) -> None:
             parsed_markdown = _run_local_parse(vault_root, record)
         parsed_relative = str(parsed_markdown.relative_to(vault_root))
         parsed_text = parsed_markdown.read_text(encoding="utf-8")
-        report = analyze_library_file(vault_root, {**record, "parsed_source_path": parsed_relative}, text_override=parsed_text, parsed_path=parsed_markdown)
+        report = analyze_library_file(
+            vault_root,
+            {**record, "parse_status": "parsed", "parsed_source_path": parsed_relative},
+            text_override=parsed_text,
+            parsed_path=parsed_markdown,
+        )
         now = _mtime_iso_from(time.time())
         job.update(
             {
@@ -313,6 +406,7 @@ def _run_library_parse_task(vault_root: Path, task_id: str) -> None:
         )
         _write_json(job_dir / "job.json", job)
         _append_job_event(job_dir, {"stage": "parse", "status": "parsed", "message": "Parse completed"})
+        _server_log("parse task completed", file_id=file_id, task_id=task_id, parsed=parsed_relative)
         record.update(
             {
                 "parse_status": "parsed",
@@ -331,6 +425,7 @@ def _run_library_parse_task(vault_root: Path, task_id: str) -> None:
         job.update({"state": "parse_failed", "current_stage": "parse_failed", "progress": 100, "error": message, "finished_at": now, "updated_at": now})
         _write_json(job_dir / "job.json", job)
         _append_job_event(job_dir, {"stage": "parse", "status": "parse_failed", "error": message})
+        _server_log("parse task failed", file_id=file_id, task_id=task_id, error=message)
         record.update({"parse_status": "parse_failed", "analysis_status": "failed", "analysis_report_path": str(Path("library") / "analysis" / f"{file_id}.json"), "updated_at": now})
         _upsert_library_record(vault_root, record)
 
@@ -447,6 +542,7 @@ PROJECT_STATUS_LABELS = {
     "analyzing": "分析中",
     "awaiting_confirmation": "待确认",
     "compiling": "编译中",
+    "waiting_review": "待人工审核",
     "succeeded": "成功",
     "failed": "失败",
 }
@@ -535,6 +631,7 @@ def project_compile_context(vault_root: Path, project_id: str, snapshot: dict[st
         if not record:
             missing_files.append(str(file_id))
             continue
+        record = _with_legacy_parse_defaults(vault_root, record)
         compile_path = str(record.get("parsed_source_path") or record["path"])
         source_files.append(
             {
@@ -560,6 +657,16 @@ def project_compile_context(vault_root: Path, project_id: str, snapshot: dict[st
         if snapshot.get("preflight_plan"):
             context["preflight_plan"] = snapshot["preflight_plan"]
     return context
+
+
+def _with_legacy_parse_defaults(vault_root: Path, record: dict[str, object]) -> dict[str, object]:
+    parse_status = str(record.get("parse_status") or "")
+    if parse_status:
+        return record
+    source_path = (vault_root / str(record.get("path", ""))).resolve()
+    if source_path.is_file() and not _requires_mineru(source_path) and record.get("analysis_status") in {"success", "warning"}:
+        return {**record, "parse_status": "parsed", "parsed_source_path": record.get("parsed_source_path", "")}
+    return {**record, "parse_status": record.get("analysis_status", "unknown")}
 
 
 def generate_project_preflight_plan(vault_root: Path, project_id: str, payload: dict[str, object] | None = None) -> dict[str, object]:
@@ -880,15 +987,22 @@ def control_compile_job(vault_root: Path, job_id: str, action: str, payload: dic
         _append_job_event(job_dir, {"stage": "control", "status": "resumed", "message": "Compile process resumed"})
         return read_job_status(vault_root, job_id)
     if action in {"terminate", "stop"}:
-        _signal_job_process(job, signal.SIGTERM)
+        previous_state = str(job.get("state", ""))
+        if previous_state in {"running", "paused", "terminating"}:
+            _signal_job_process(job, signal.SIGTERM)
         job.update({"state": "terminating", "current_stage": "terminating", "updated_at": _mtime_iso_from(time.time())})
+        if previous_state == "waiting_review":
+            job["state"] = "terminated"
+            job["finished_at"] = _mtime_iso_from(time.time())
         _write_json(job_path, job)
-        _append_job_event(job_dir, {"stage": "control", "status": "terminating", "message": "Compile process termination requested"})
+        _append_job_event(job_dir, {"stage": "control", "status": job["state"], "message": "Compile process termination requested"})
         return read_job_status(vault_root, job_id)
     if action in {"rerun-current", "rerun-from-node", "clear-results-rerun"}:
         node = str(payload.get("node") or job.get("current_stage") or "")
         clear = action == "clear-results-rerun" or bool(payload.get("clear_results"))
         return _rerun_compile_job(vault_root, job, rerun_from_node=node, clear_results=clear)
+    if action in {"approve", "request-modification", "require-modification", "rerun", "rollback", "skip"}:
+        return _handle_review_action(vault_root, job, action, payload)
     raise ValueError("Unknown job control action")
 
 
@@ -902,12 +1016,69 @@ def _signal_job_process(job: dict[str, object], sig: int) -> None:
         raise ValueError("Compile process is no longer running") from None
 
 
-def _rerun_compile_job(vault_root: Path, previous_job: dict[str, object], *, rerun_from_node: str, clear_results: bool) -> dict[str, object]:
+def _handle_review_action(vault_root: Path, job: dict[str, object], action: str, payload: dict[str, object]) -> dict[str, object]:
+    job_dir = _job_dir(vault_root, str(job["id"]))
+    if job.get("state") != "waiting_review" and not (_job_course_path(vault_root, job) / "human_review.json").exists():
+        raise ValueError("Job is not waiting for human review")
+    normalized = "request-modification" if action == "require-modification" else action
+    node = str(payload.get("node") or job.get("current_stage") or "human_review")
+    feedback = str(payload.get("feedback") or payload.get("comment") or "").strip()
+    decision = {
+        "timestamp": _mtime_iso_from(time.time()),
+        "action": normalized,
+        "node": node,
+        "feedback": feedback,
+        "target_node": str(payload.get("target_node") or node),
+    }
+    _append_review_decision(job_dir, decision)
+    _append_job_event(job_dir, {"stage": "human_review", "status": normalized, "message": feedback or normalized})
+    if normalized == "approve":
+        return _rerun_compile_job(vault_root, job, rerun_from_node=str(payload.get("target_node") or "repair_course"), clear_results=False, review_decision=decision)
+    if normalized == "skip":
+        return _rerun_compile_job(vault_root, job, rerun_from_node=str(payload.get("target_node") or "export_version"), clear_results=False, review_decision=decision)
+    if normalized == "rollback":
+        return _rerun_compile_job(vault_root, job, rerun_from_node=str(payload.get("target_node") or "plan_course"), clear_results=False, review_decision=decision)
+    return _rerun_compile_job(vault_root, job, rerun_from_node=str(payload.get("target_node") or node), clear_results=False, review_decision=decision)
+
+
+def _append_review_decision(job_dir: Path, decision: dict[str, object]) -> None:
+    job_dir.mkdir(parents=True, exist_ok=True)
+    with (job_dir / "review_decisions.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(decision, ensure_ascii=False) + "\n")
+
+
+def _read_review_decisions(job_dir: Path) -> list[dict[str, object]]:
+    path = job_dir / "review_decisions.jsonl"
+    if not path.exists():
+        return []
+    decisions: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            decisions.append(item)
+    return decisions
+
+
+def _rerun_compile_job(
+    vault_root: Path,
+    previous_job: dict[str, object],
+    *,
+    rerun_from_node: str,
+    clear_results: bool,
+    review_decision: dict[str, object] | None = None,
+) -> dict[str, object]:
     project_id = str(previous_job.get("project_id") or "")
     context_path = _job_dir(vault_root, str(previous_job["id"])) / "compile_context.json"
     if not context_path.exists():
         raise FileNotFoundError("compile_context.json")
     context = _read_json(context_path)
+    if review_decision:
+        feedback = list(context.get("review_feedback", [])) if isinstance(context, dict) else []
+        feedback.append(review_decision)
+        context["review_feedback"] = feedback
     snapshot = context.get("confirmed_compile_snapshot", {}) if isinstance(context, dict) else {}
     sources = [Path(str(item["path"])) for item in context.get("source_files", []) if isinstance(item, dict)]
     version = str(previous_job.get("version") or f"v{time.strftime('%Y%m%d%H%M%S')}")
@@ -932,7 +1103,12 @@ def _rerun_compile_job(vault_root: Path, previous_job: dict[str, object], *, rer
         "compile_requirements": previous_job.get("compile_requirements", default_compile_requirements()),
         "confirmed_plan_id": previous_job.get("confirmed_plan_id", ""),
         "selected_scheme_id": previous_job.get("selected_scheme_id", ""),
-        "rerun": {"from_node": rerun_from_node, "clear_results": clear_results, "previous_job_id": previous_job.get("id", "")},
+        "rerun": {
+            "from_node": rerun_from_node,
+            "clear_results": clear_results,
+            "previous_job_id": previous_job.get("id", ""),
+            "review_action": review_decision.get("action", "") if review_decision else "",
+        },
         "created_at": _mtime_iso_from(time.time()),
         "updated_at": _mtime_iso_from(time.time()),
     }
@@ -942,6 +1118,7 @@ def _rerun_compile_job(vault_root: Path, previous_job: dict[str, object], *, rer
     _write_json(job_dir / "job.json", job)
     _append_job_event(job_dir, {"stage": "control", "status": "rerun_queued", "message": f"Rerun from {rerun_from_node or 'start'}"})
     _set_project_status(vault_root, project_id, "queued", {"last_job_id": job_id, "last_compile_version": version})
+    _server_log("compile rerun queued", job_id=job_id, project_id=project_id, from_node=rerun_from_node or "start")
     threading.Thread(target=_run_compile_job, args=(vault_root, job_id, command), daemon=True).start()
     return _job_response(job)
 
@@ -994,7 +1171,7 @@ def start_project_compile_job(vault_root: Path, project_id: str, payload: dict[s
         "started_at": "",
         "finished_at": "",
         "exit_code": None,
-        "error": f"Sources require completed parsing before compile: {', '.join(blocked_sources)}" if blocked_sources else "",
+        "error": f"Sources require completed MinerU/parse tasks before compile: {', '.join(blocked_sources)}" if blocked_sources else "",
         "command": [],
         "compile_requirements": context.get("compile_requirements", default_compile_requirements()),
         "confirmed_plan_id": snapshot.get("plan_id", ""),
@@ -1007,12 +1184,14 @@ def start_project_compile_job(vault_root: Path, project_id: str, payload: dict[s
     if blocked_sources:
         _append_job_event(job_dir, {"stage": "prepare", "status": "blocked", "message": job["error"]})
         _set_project_status(vault_root, project_id, "failed", {"last_job_id": job_id, "last_compile_version": version})
+        _server_log("compile blocked", job_id=job_id, project_id=project_id, reason=job["error"])
         return _job_response(job)
 
     command = _build_compile_command(vault_root, sources, course_id, version, job_dir, snapshot)
     job["command"] = command
     _write_json(job_dir / "job.json", job)
     _set_project_status(vault_root, project_id, "queued", {"last_job_id": job_id, "last_compile_version": version})
+    _server_log("compile job queued", job_id=job_id, project_id=project_id, course_id=course_id, version=version)
     thread = threading.Thread(target=_run_compile_job, args=(vault_root, job_id, command), daemon=True)
     thread.start()
     return _job_response(job)
@@ -1025,6 +1204,7 @@ def _run_compile_job(vault_root: Path, job_id: str, command: list[str]) -> None:
     _write_json(job_dir / "job.json", job)
     _set_project_status(vault_root, str(job.get("project_id", "")), "compiling", {"last_job_id": job_id, "last_compile_version": job.get("version", "")})
     _append_job_event(job_dir, {"stage": "job", "status": "started", "message": "Compile process started"})
+    _server_log("compile job started", job_id=job_id, course_id=job.get("course_id", ""), version=job.get("version", ""))
     try:
         process = subprocess.Popen(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         job = _read_json(job_dir / "job.json")
@@ -1054,9 +1234,12 @@ def _run_compile_job(vault_root: Path, job_id: str, command: list[str]) -> None:
             job["error"] = "Compile process was terminated"
         elif exit_code != 0:
             job["error"] = f"Compile process exited with code {exit_code}"
+        job = _refresh_job_review_state(vault_root, job)
         _write_json(job_dir / "job.json", job)
+        _sync_job_node_results(vault_root, job)
         _append_job_event(job_dir, {"stage": "job", "status": job["state"], "exit_code": exit_code})
         _update_project_job_status(vault_root, str(job["project_id"]), job)
+        _server_log("compile job finished", job_id=job_id, state=job.get("state", ""), exit_code=exit_code, error=job.get("error", ""))
     except Exception as exc:  # pragma: no cover - subprocess environment specific
         job = _read_json(job_dir / "job.json")
         job.update(
@@ -1068,9 +1251,12 @@ def _run_compile_job(vault_root: Path, job_id: str, command: list[str]) -> None:
                 "error": repr(exc),
             }
         )
+        job = _refresh_job_review_state(vault_root, job)
         _write_json(job_dir / "job.json", job)
+        _sync_job_node_results(vault_root, job)
         _append_job_event(job_dir, {"stage": "job", "status": "failed", "error": repr(exc)})
         _update_project_job_status(vault_root, str(job["project_id"]), job)
+        _server_log("compile job failed", job_id=job_id, error=repr(exc))
 
 
 def read_job_status(vault_root: Path, job_id: str) -> dict[str, object]:
@@ -1080,12 +1266,205 @@ def read_job_status(vault_root: Path, job_id: str) -> dict[str, object]:
         raise FileNotFoundError(job_id)
     job = _read_json(job_path)
     events = _read_job_events(job_dir)
+    job = _refresh_job_review_state(vault_root, job)
     if job.get("state") in {"running", "paused", "terminating"}:
         latest = next((event for event in reversed(events) if event.get("stage") and event.get("status") != "output"), {})
         if latest:
             job["current_stage"] = str(latest.get("stage", job.get("current_stage", "")))
             job["progress"] = _job_progress_from_events(job_dir)
-    return {**_job_response(job), "events": events[-40:]}
+    _write_json(job_path, job)
+    nodes = _sync_job_node_results(vault_root, job)
+    return {**_job_response(job), "events": events[-40:], "nodes": _job_node_summaries(nodes)}
+
+
+def list_job_node_results(vault_root: Path, job_id: str) -> list[dict[str, object]]:
+    job = _read_json(_job_dir(vault_root, job_id) / "job.json")
+    nodes = _sync_job_node_results(vault_root, job)
+    return _job_node_summaries(nodes)
+
+
+def read_job_node_result(vault_root: Path, job_id: str, node: str) -> dict[str, object]:
+    job = _read_json(_job_dir(vault_root, job_id) / "job.json")
+    nodes = {str(item.get("node")): item for item in _sync_job_node_results(vault_root, job)}
+    if node not in nodes:
+        raise FileNotFoundError(node)
+    return nodes[node]
+
+
+def _refresh_job_review_state(vault_root: Path, job: dict[str, object]) -> dict[str, object]:
+    if job.get("state") in {"done", "terminated"}:
+        return job
+    review_path = _job_course_path(vault_root, job) / "human_review.json"
+    if review_path.exists():
+        job = dict(job)
+        job["state"] = "waiting_review"
+        job["current_stage"] = "human_review"
+        job["progress"] = max(int(job.get("progress") or 0), _job_progress_from_events(_job_dir(vault_root, str(job["id"]))))
+        job["review"] = _read_json_if_exists(review_path, {})
+        job["updated_at"] = _mtime_iso_from(time.time())
+    return job
+
+
+def _sync_job_node_results(vault_root: Path, job: dict[str, object]) -> list[dict[str, object]]:
+    job_dir = _job_dir(vault_root, str(job["id"]))
+    course_path = _job_course_path(vault_root, job)
+    events = _read_job_events(job_dir)
+    nodes: list[dict[str, object]] = []
+    for node in _compile_node_order():
+        result = _build_job_node_result(job_dir, course_path, node, events, job)
+        nodes.append(result)
+        _write_json(_job_node_result_path(job_dir, node), result)
+    return nodes
+
+
+def _build_job_node_result(job_dir: Path, course_path: Path, node: str, events: list[dict[str, object]], job: dict[str, object]) -> dict[str, object]:
+    node_events = [event for event in events if str(event.get("stage")) == node]
+    status = _node_status(node, node_events, job)
+    errors = [
+        {key: event.get(key) for key in ("timestamp", "stage", "status", "error", "message") if event.get(key)}
+        for event in node_events
+        if event.get("status") == "failed" or event.get("error")
+    ]
+    if node == job.get("current_stage") and job.get("error"):
+        errors.append({"stage": node, "status": job.get("state", ""), "message": job.get("error", "")})
+    artifacts = COMPILE_NODE_ARTIFACTS.get(node, {"inputs": [], "outputs": []})
+    result = {
+        "node": node,
+        "status": status,
+        "started_at": _first_event_timestamp(node_events, "started"),
+        "finished_at": _last_event_timestamp(node_events, {"finished", "failed"}),
+        "next_action": _last_event_value(node_events, "next_action"),
+        "duration_seconds": _last_event_value(node_events, "duration_seconds"),
+        "inputs": [_artifact_snapshot(job_dir, course_path, name) for name in artifacts.get("inputs", [])],
+        "outputs": [_artifact_snapshot(job_dir, course_path, name) for name in artifacts.get("outputs", [])],
+        "logs": node_events[-60:],
+        "errors": errors,
+        "updated_at": _mtime_iso_from(time.time()),
+    }
+    if node == "human_review":
+        result["review"] = _read_json_if_exists(course_path / "human_review.json", {})
+        result["review_decisions"] = _read_review_decisions(job_dir)
+    return result
+
+
+def _node_status(node: str, node_events: list[dict[str, object]], job: dict[str, object]) -> str:
+    if node == "human_review" and job.get("state") == "waiting_review":
+        return "waiting_review"
+    statuses = [str(event.get("status", "")) for event in node_events]
+    if "failed" in statuses:
+        return "failed"
+    if "finished" in statuses:
+        return "finished"
+    if "started" in statuses:
+        return "running"
+    if node == job.get("current_stage") and job.get("state") in {"running", "paused", "terminating"}:
+        return str(job.get("state"))
+    return "pending"
+
+
+def _artifact_snapshot(job_dir: Path, course_path: Path, name: str) -> dict[str, object]:
+    if name == "compile_context.json":
+        path = job_dir / name
+    else:
+        path = course_path / name
+    exists = path.exists()
+    item: dict[str, object] = {
+        "name": name,
+        "path": str(path),
+        "exists": exists,
+    }
+    if not exists or not path.is_file():
+        return item
+    item["size"] = path.stat().st_size
+    item["updated_at"] = _mtime_iso(path)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix == ".json":
+        try:
+            parsed = json.loads(text)
+            item["json_type"] = type(parsed).__name__
+            item["preview"] = _json_preview(parsed)
+        except json.JSONDecodeError:
+            item["preview"] = _short_preview(text, 1200)
+    else:
+        item["preview"] = _short_preview(text, 1600)
+    return item
+
+
+def _json_preview(value: object) -> object:
+    if isinstance(value, dict):
+        preview: dict[str, object] = {}
+        for key, item in list(value.items())[:12]:
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                preview[str(key)] = item
+            elif isinstance(item, list):
+                preview[str(key)] = {"type": "list", "count": len(item), "sample": item[:2]}
+            elif isinstance(item, dict):
+                preview[str(key)] = {"type": "dict", "keys": list(item.keys())[:8]}
+            else:
+                preview[str(key)] = str(type(item).__name__)
+        return preview
+    if isinstance(value, list):
+        return {"type": "list", "count": len(value), "sample": value[:3]}
+    return value
+
+
+def _compile_node_order() -> list[str]:
+    return [
+        "parse_sources",
+        "understand_images",
+        "build_source_index",
+        "synthesize_source_brief",
+        "plan_course",
+        "synthesize_lesson_notes",
+        "extract_units",
+        "organize_logic",
+        "detect_gaps",
+        "generate_lessons",
+        "synthesize_compile_plan",
+        "review_compile_plan_llm",
+        "revise_compile_plan",
+        "synthesize_lesson_bodies",
+        "check_markdown_syntax",
+        "check_grounding_rules",
+        "check_quality_rules",
+        "repair_course",
+        "human_review",
+        "export_version",
+    ]
+
+
+def _job_node_summaries(nodes: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "node": item.get("node", ""),
+            "status": item.get("status", ""),
+            "started_at": item.get("started_at", ""),
+            "finished_at": item.get("finished_at", ""),
+            "output_count": sum(1 for output in item.get("outputs", []) if isinstance(output, dict) and output.get("exists")),
+            "error_count": len(item.get("errors", [])) if isinstance(item.get("errors"), list) else 0,
+        }
+        for item in nodes
+    ]
+
+
+def _job_node_result_path(job_dir: Path, node: str) -> Path:
+    return job_dir / "nodes" / f"{_safe_filename(node)}.json"
+
+
+def _job_course_path(vault_root: Path, job: dict[str, object]) -> Path:
+    return vault_root / "courses" / str(job.get("course_id") or "")
+
+
+def _first_event_timestamp(events: list[dict[str, object]], status: str) -> str:
+    return str(next((event.get("timestamp", "") for event in events if event.get("status") == status), ""))
+
+
+def _last_event_timestamp(events: list[dict[str, object]], statuses: set[str]) -> str:
+    return str(next((event.get("timestamp", "") for event in reversed(events) if event.get("status") in statuses), ""))
+
+
+def _last_event_value(events: list[dict[str, object]], key: str) -> object:
+    return next((event.get(key) for event in reversed(events) if key in event), "")
 
 
 def list_project_jobs(vault_root: Path, project_id: str) -> list[dict[str, object]]:
@@ -1099,6 +1478,9 @@ def list_project_jobs(vault_root: Path, project_id: str) -> list[dict[str, objec
         except json.JSONDecodeError:
             continue
         if str(job.get("project_id")) == project_id:
+            job = _refresh_job_review_state(vault_root, job)
+            _write_json(path, job)
+            _sync_job_node_results(vault_root, job)
             jobs.append(_job_response(job))
     return sorted(jobs, key=lambda item: str(item.get("created_at", "")), reverse=True)
 
@@ -1120,6 +1502,7 @@ def _job_response(job: dict[str, object]) -> dict[str, object]:
         "selected_scheme_id": job.get("selected_scheme_id", ""),
         "pid": job.get("pid", 0),
         "rerun": job.get("rerun", {}),
+        "review": job.get("review", {}),
         "status_url": f"/api/jobs/{job['id']}",
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("updated_at", ""),
@@ -1180,7 +1563,12 @@ def _job_progress_from_events(job_dir: Path) -> int:
 
 
 def _update_project_job_status(vault_root: Path, project_id: str, job: dict[str, object]) -> None:
-    state = "succeeded" if job.get("state") == "done" else "failed"
+    if job.get("state") == "done":
+        state = "succeeded"
+    elif job.get("state") == "waiting_review":
+        state = "waiting_review"
+    else:
+        state = "failed"
     _set_project_status(
         vault_root,
         project_id,
@@ -1234,6 +1622,8 @@ def course_summary(vault_root: Path, course_id: str) -> dict[str, object]:
 def list_versions(vault_root: Path, course_id: str) -> list[dict[str, object]]:
     versions_dir = _course_path(vault_root, course_id) / "versions"
     versions: list[dict[str, object]] = []
+    if not versions_dir.exists():
+        return versions
     for version_dir in sorted((item for item in versions_dir.iterdir() if item.is_dir()), key=_version_sort_key):
         lesson_dir = version_dir / "lessons"
         lessons = [
