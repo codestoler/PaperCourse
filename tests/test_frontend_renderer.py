@@ -191,7 +191,23 @@ class FrontendRendererTests(unittest.TestCase):
             """
             const { renderJobIntermediatePanel } = require('./frontend/app.js');
             const html = renderJobIntermediatePanel(
-              { id: 'job-1', state: 'waiting_review', current_stage: 'human_review' },
+              {
+                id: 'job-1',
+                state: 'waiting_review',
+                current_stage: 'human_review',
+                review_summary: {
+                  reason: 'needs review',
+                  default_target_node: 'repair_course',
+                  failures: [{
+                    stage: 'quality_rules',
+                    type: 'broken_formula',
+                    lesson_id: 'lesson-013',
+                    lesson_title: 'Broken Formula',
+                    line: 63,
+                    message: 'Displayed formula delimiter appears broken.'
+                  }]
+                }
+              },
               [
                 { node: 'synthesize_source_brief', status: 'finished', output_count: 2, error_count: 0 },
                 { node: 'check_markdown_syntax', status: 'failed', output_count: 1, error_count: 1 },
@@ -215,8 +231,14 @@ class FrontendRendererTests(unittest.TestCase):
         self.assertIn("synthesize_source_brief", html)
         self.assertIn("check_markdown_syntax", html)
         self.assertIn("流程已阻塞在人工审核", html)
+        self.assertIn("lesson-013", html)
+        self.assertIn("Broken Formula", html)
+        self.assertIn("broken_formula", html)
+        self.assertIn("技术详情", html)
         self.assertIn("data-job-review=\"approve\"", html)
         self.assertIn("data-job-review=\"request-modification\"", html)
+        self.assertIn("允许自动修复并继续", html)
+        self.assertIn("跳过审核并尝试导出", html)
         self.assertIn("data-job-control=\"terminate\"", html)
         self.assertIn("source_brief.json", html)
         self.assertIn("review_decisions.jsonl", html)
@@ -275,6 +297,8 @@ class FrontendRendererTests(unittest.TestCase):
         self.assertIn("解析完成后可用于课程生成", html)
         self.assertIn("收起解析结果", html)
         self.assertIn("MinerU failed", html)
+        self.assertIn('class="danger" data-library-delete="file-1"', html)
+        self.assertIn("删除受限", html)
 
     def test_library_file_item_marks_parsed_file_ready_for_compile(self) -> None:
         html = self.run_node_json(
@@ -300,6 +324,8 @@ class FrontendRendererTests(unittest.TestCase):
 
         self.assertIn("可用于课程生成", html)
         self.assertIn('value="100"', html)
+        self.assertIn('class="danger" data-library-delete="file-1"', html)
+        self.assertNotIn('data-library-delete="file-1" disabled', html)
 
     def test_project_job_status_renders_control_states_from_backend_job(self) -> None:
         html = self.run_node_json(

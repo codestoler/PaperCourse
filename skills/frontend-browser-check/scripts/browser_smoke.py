@@ -21,6 +21,7 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:8766")
     parser.add_argument("--chrome-path", default="", help="Optional explicit Chromium executable path")
     parser.add_argument("--exercise-library-project-flow", action="store_true")
+    parser.add_argument("--exercise-upload-compile-flow", action="store_true")
     args = parser.parse_args()
 
     chrome_path = Path(args.chrome_path).resolve() if args.chrome_path else find_chromium()
@@ -44,9 +45,11 @@ def main() -> int:
         assert "course_structure" in requirements, "default course_structure requirement missing"
         assert "formula_handling" in requirements, "default formula_handling requirement missing"
 
-        if args.exercise_library_project_flow:
+        if args.exercise_library_project_flow or args.exercise_upload_compile_flow:
             temp_upload = make_upload_file()
             cleanup = exercise_library_project_flow(page, temp_upload, requirements)
+            if args.exercise_upload_compile_flow:
+                exercise_upload_compile_flow(page, cleanup)
 
         browser.close()
 
@@ -127,7 +130,45 @@ def exercise_library_project_flow(page, upload_path: Path, default_requirements:
     )
     assert context["source_files"][0]["id"] == record["id"], context
     assert context["compile_requirements"]["exercise_ratio"] == "每节至少 2 个检查项。", context
-    return {"file_id": record["id"], "project_id": project["id"]}
+    return {"file_id": record["id"], "project_id": project["id"], "course_id": project["id"]}
+
+
+def exercise_upload_compile_flow(page, cleanup: dict[str, str]) -> None:
+    project_id = cleanup["project_id"]
+    page.locator(f'[data-project-plan="{project_id}"]').click()
+    page.wait_for_function(
+        '(projectId) => fetch("/api/projects").then(r => r.json()).then(data => data.projects.some(p => p.id === projectId && p.latest_preflight_plan_id))',
+        arg=project_id,
+        timeout=15_000,
+    )
+    page.evaluate(
+        """(projectId) => {
+          const quick = document.querySelector(`input[name="scheme-${CSS.escape(projectId)}"][value="quick_review"]`);
+          if (quick) quick.checked = true;
+        }""",
+        project_id,
+    )
+    page.locator(f'[data-project-confirm-plan="{project_id}"]').click()
+    page.wait_for_function(
+        '(projectId) => fetch("/api/projects").then(r => r.json()).then(data => data.projects.some(p => p.id === projectId && p.confirmed_compile_snapshot && p.confirmed_compile_snapshot.plan_id))',
+        arg=project_id,
+        timeout=15_000,
+    )
+    page.locator(f'[data-project-compile="{project_id}"]').click()
+    page.wait_for_function(
+        """(projectId) => fetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`)
+          .then(r => r.json())
+          .then(data => data.jobs.some(job => job.state === "done"))""",
+        arg=project_id,
+        timeout=120_000,
+    )
+    page.wait_for_function(
+        """(courseId) => fetch("/api/courses")
+          .then(r => r.json())
+          .then(data => data.courses.some(course => course.id === courseId))""",
+        arg=cleanup["course_id"],
+        timeout=15_000,
+    )
 
 
 def cleanup_smoke_records(cleanup: dict[str, str]) -> None:
@@ -135,7 +176,12 @@ def cleanup_smoke_records(cleanup: dict[str, str]) -> None:
     project_id = cleanup.get("project_id")
     if file_id:
         shutil.rmtree(ROOT / "course-vault" / "library" / "files" / file_id, ignore_errors=True)
+        shutil.rmtree(ROOT / "course-vault" / "parsed" / "library" / file_id, ignore_errors=True)
         (ROOT / "course-vault" / "library" / "analysis" / f"{file_id}.json").unlink(missing_ok=True)
+        parse_root = ROOT / "course-vault" / "parse-jobs"
+        if parse_root.exists():
+            for parse_job in parse_root.glob(f"parse-{file_id}-*"):
+                shutil.rmtree(parse_job, ignore_errors=True)
         index_path = ROOT / "course-vault" / "library" / "library_index.json"
         if index_path.exists():
             data = json.loads(index_path.read_text(encoding="utf-8"))
@@ -143,6 +189,16 @@ def cleanup_smoke_records(cleanup: dict[str, str]) -> None:
             index_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if project_id:
         shutil.rmtree(ROOT / "course-vault" / "projects" / project_id, ignore_errors=True)
+        shutil.rmtree(ROOT / "course-vault" / "courses" / project_id, ignore_errors=True)
+        jobs_dir = ROOT / "course-vault" / "jobs"
+        if jobs_dir.exists():
+            for job_path in jobs_dir.glob("*/job.json"):
+                try:
+                    job = json.loads(job_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if job.get("project_id") == project_id:
+                    shutil.rmtree(job_path.parent, ignore_errors=True)
 
 
 if __name__ == "__main__":

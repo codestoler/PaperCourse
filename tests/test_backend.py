@@ -11,12 +11,14 @@ from backend.server import (
     create_course_project,
     confirm_project_preflight_plan,
     control_compile_job,
+    delete_library_file,
     delete_lesson_entry,
     generate_project_preflight_plan,
     list_job_node_results,
     list_course_projects,
     list_courses,
     list_library_files,
+    library_file_usage,
     list_versions,
     list_project_jobs,
     project_compile_context,
@@ -142,6 +144,99 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(parse_status["parse_job"]["state"], "parsed")
             self.assertEqual(parse_job["parsed_source_path"], record["parsed_source_path"])
             self.assertFalse((root / "courses").exists())
+
+    def test_delete_library_file_removes_unreferenced_source_and_artifacts(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record = store_library_upload(root, "notes.md", BytesIO(b"# Topic\n\nGrounded text."))
+            raw_dir = (root / str(record["path"])).parent
+            parsed_dir = (root / str(record["parsed_source_path"])).parent
+            analysis_path = root / str(record["analysis_report_path"])
+            parse_job_dir = root / "parse-jobs" / str(record["parse_task_id"])
+
+            result = delete_library_file(root, str(record["id"]))
+
+            self.assertTrue(result["deleted"])
+            self.assertEqual(list_library_files(root), [])
+            self.assertFalse(raw_dir.exists())
+            self.assertFalse(parsed_dir.exists())
+            self.assertFalse(analysis_path.exists())
+            self.assertFalse(parse_job_dir.exists())
+
+    def test_delete_library_file_blocks_project_and_course_references(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record = store_library_upload(root, "notes.md", BytesIO(b"# Topic\n\nGrounded text."))
+            project = create_course_project(root, {"title": "Using Project", "library_file_ids": [record["id"]]})
+            course = root / "courses" / "using-course"
+            course.mkdir(parents=True)
+            (course / "course_meta.json").write_text(
+                json.dumps({"course_id": "using-course", "source_files": [record["parsed_source_path"]]}),
+                encoding="utf-8",
+            )
+
+            usage = library_file_usage(root, str(record["id"]))
+
+            self.assertEqual(usage["projects"][0]["id"], project["id"])
+            self.assertEqual(usage["courses"][0]["id"], "using-course")
+            self.assertFalse(list_library_files(root)[0]["can_delete"])
+            self.assertIn("Using Project", list_library_files(root)[0]["delete_block_reason"])
+            with self.assertRaisesRegex(ValueError, "不能删除"):
+                delete_library_file(root, str(record["id"]))
+            self.assertEqual(len(list_library_files(root)), 1)
+
+    def test_stale_parse_job_is_marked_failed_and_can_be_reparsed(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library_dir = root / "library"
+            source_dir = library_dir / "files" / "source-1"
+            source_dir.mkdir(parents=True)
+            (source_dir / "source.pdf").write_bytes(b"%PDF-1.4\n")
+            (library_dir / "library_index.json").write_text(
+                json.dumps(
+                    {
+                        "files": [
+                            {
+                                "id": "source-1",
+                                "filename": "source.pdf",
+                                "path": "library/files/source-1/source.pdf",
+                                "size": 9,
+                                "analysis_status": "parsing",
+                                "parse_status": "parsing",
+                                "parse_task_id": "parse-1",
+                                "parsed_source_path": "",
+                                "uploaded_at": "2026-01-01T00:00:00+00:00",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            job_dir = root / "parse-jobs" / "parse-1"
+            job_dir.mkdir(parents=True)
+            (job_dir / "job.json").write_text(
+                json.dumps({"id": "parse-1", "file_id": "source-1", "state": "parsing", "current_stage": "mineru_parse", "progress": 10}),
+                encoding="utf-8",
+            )
+            (job_dir / "events.jsonl").write_text(
+                json.dumps({"timestamp": "2026-01-01T00:00:00+00:00", "stage": "mineru_poll", "status": "running"}) + "\n",
+                encoding="utf-8",
+            )
+
+            file = list_library_files(root)[0]
+            job = read_parse_job_status(root, "parse-1")
+
+            self.assertEqual(file["parse_status"], "parse_failed")
+            self.assertTrue(file["parse_is_stale"])
+            self.assertEqual(job["state"], "parse_failed")
+            self.assertIn("解析任务超时", job["error"])
+            self.assertFalse(file["can_compile"])
 
     def test_library_file_list_includes_parse_progress_and_compile_readiness(self) -> None:
         import tempfile
@@ -491,11 +586,35 @@ class BackendTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (course_dir / "human_review.json").write_text(json.dumps({"reason": "needs review"}), encoding="utf-8")
+            (course_dir / "human_review.json").write_text(
+                json.dumps(
+                    {
+                        "reason": "needs review",
+                        "validation_report": {
+                            "ok": False,
+                            "failures": [
+                                {
+                                    "stage": "quality_rules",
+                                    "type": "broken_formula",
+                                    "lesson_id": "lesson-013",
+                                    "lesson_title": "Broken Formula",
+                                    "line": 63,
+                                    "message": "Displayed formula delimiter appears broken.",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             status = read_job_status(root, "job-1")
             self.assertEqual(status["state"], "waiting_review")
-            self.assertEqual(read_job_node_result(root, "job-1", "human_review")["status"], "waiting_review")
+            review_node = read_job_node_result(root, "job-1", "human_review")
+            self.assertEqual(review_node["status"], "waiting_review")
+            self.assertEqual(status["review_summary"]["failure_count"], 1)
+            self.assertEqual(status["review_summary"]["failures"][0]["lesson_id"], "lesson-013")
+            self.assertEqual(review_node["review_summary"]["default_target_node"], "repair_course")
 
             class FakeThread:
                 def __init__(self, *args, **kwargs) -> None:

@@ -252,6 +252,14 @@ button.active {
   color: #991b1b;
 }
 
+.project-next-step {
+  display: block;
+  margin-top: 6px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .resource-meta,
 .resource-actions {
   display: flex;
@@ -263,6 +271,17 @@ button.active {
 
 .resource-actions button {
   width: auto;
+}
+
+.resource-actions button.danger {
+  border-color: #fecaca;
+  background: #fff5f5;
+  color: #991b1b;
+}
+
+.resource-actions button.danger:hover:not(:disabled) {
+  border-color: #fca5a5;
+  background: #fee2e2;
 }
 
 .analysis-report {
@@ -580,6 +599,38 @@ button.active {
   gap: 4px;
   color: #5b6472;
   font-size: 12px;
+}
+
+.review-failure-list {
+  display: grid;
+  gap: 8px;
+}
+
+.review-failure-list article {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  background: #fff7f7;
+}
+
+.review-failure-list span,
+.review-failure-list p {
+  margin: 0;
+  color: #5b6472;
+  font-size: 12px;
+}
+
+.technical-details {
+  display: grid;
+  gap: 10px;
+}
+
+.technical-details summary {
+  cursor: pointer;
+  color: #334155;
+  font-weight: 700;
 }
 
 .artifact-preview {

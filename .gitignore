@@ -11,5 +11,6 @@ course-vault/parsed
 course-vault/library
 course-vault/jobs
 course-vault/parse-jobs
+course-vault/projects
 user_feedback/
 logs/

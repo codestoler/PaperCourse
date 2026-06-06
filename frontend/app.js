@@ -135,14 +135,18 @@ function renderLibraryFiles() {
   libraryFileList.querySelectorAll("[data-library-reparse]").forEach((button) => {
     button.addEventListener("click", () => reparseLibraryFile(button.dataset.libraryReparse));
   });
+  libraryFileList.querySelectorAll("[data-library-delete]").forEach((button) => {
+    button.addEventListener("click", () => deleteLibraryFile(button.dataset.libraryDelete));
+  });
 }
 
 function renderLibraryFileItem(file, report = null, reportOpenOverride = null) {
   const status = file.parse_status || file.analysis_status || "unknown";
   const progressValue = parseProgressValue(file);
-  const isParsing = ["waiting_parse", "parsing"].includes(status);
+  const isParsing = isActiveParse(file);
   const canCompile = Boolean(file.can_compile || (status === "parsed" && file.parsed_source_path));
   const usageText = canCompile ? "可用于课程生成" : status === "parse_failed" ? "解析失败，需重新解析后使用" : "解析完成后可用于课程生成";
+  const deleteReason = file.delete_block_reason || libraryDeleteBlockReason(file);
   const reportOpen = reportOpenOverride === null ? openLibraryReports.has(file.id) : Boolean(reportOpenOverride);
   return `
     <article class="resource-item">
@@ -155,6 +159,7 @@ function renderLibraryFileItem(file, report = null, reportOpenOverride = null) {
           <span>${progressValue}% · ${escapeHtml(parseStageLabel(file.parse_current_stage || status))}</span>
         </div>
         <small class="parse-usage ${canCompile ? "ready" : "pending"}">${escapeHtml(usageText)}</small>
+        ${deleteReason ? `<small class="parse-usage pending">删除受限：${escapeHtml(deleteReason)}</small>` : ""}
         ${file.parse_error ? `<small class="parse-error">${escapeHtml(file.parse_error)}</small>` : ""}
       </div>
       <div class="resource-meta">
@@ -164,10 +169,28 @@ function renderLibraryFileItem(file, report = null, reportOpenOverride = null) {
       <div class="resource-actions">
         <button type="button" data-library-report="${escapeAttr(file.id)}">${reportOpen ? "收起解析结果" : "查看解析结果"}</button>
         <button type="button" data-library-reparse="${escapeAttr(file.id)}"${isParsing ? " disabled" : ""}>重新解析</button>
+        <button type="button" class="danger" data-library-delete="${escapeAttr(file.id)}">删除</button>
       </div>
       ${reportOpen ? `<div class="analysis-report">${report ? renderAnalysisReport(report) : `<p class="muted">正在读取解析报告...</p>`}</div>` : ""}
     </article>
   `;
+}
+
+function isActiveParse(file) {
+  const status = file?.parse_status || file?.analysis_status || "unknown";
+  return ["waiting_parse", "parsing"].includes(status) && !file?.parse_is_stale;
+}
+
+function libraryDeleteBlockReason(file) {
+  if (isActiveParse(file)) {
+    return "资料仍在解析中，请等待解析结束后再删除";
+  }
+  const projects = file?.usage?.projects || [];
+  const courses = file?.usage?.courses || [];
+  if (projects.length || courses.length) {
+    return `资料仍被使用：${[...projects, ...courses].map((item) => item.title || item.id).join(", ")}`;
+  }
+  return "";
 }
 
 function parseProgressValue(file) {
@@ -295,12 +318,49 @@ function renderAnalysisReport(report) {
 async function reparseLibraryFile(fileId) {
   const response = await fetch(`/api/library/files/${encodeURIComponent(fileId)}/parse`, { method: "POST" });
   if (!response.ok) {
-    window.alert(`启动解析失败: ${response.status}`);
+    window.alert(await responseErrorMessage(response, "启动解析失败"));
     return;
   }
   delete libraryAnalysisReports[fileId];
   openLibraryReports.add(fileId);
   await loadLibraryFiles();
+}
+
+async function deleteLibraryFile(fileId) {
+  const file = libraryFiles.find((item) => item.id === fileId) || { id: fileId, filename: fileId };
+  const name = file.filename || file.id || fileId;
+  const blockReason = file.delete_block_reason || libraryDeleteBlockReason(file);
+  if (blockReason) {
+    window.alert(`暂不能删除资料“${name}”。\n${blockReason}`);
+    return;
+  }
+  const confirmed = window.confirm(`删除资料“${name}”？\n\n仅当没有课程或课程项目使用这一来源时才会删除。此操作会移除原始文件和解析结果。`);
+  if (!confirmed) {
+    return;
+  }
+  const response = await fetch(`/api/library/files/${encodeURIComponent(fileId)}`, { method: "DELETE" });
+  if (!response.ok) {
+    window.alert(await responseErrorMessage(response, "删除资料失败"));
+    return;
+  }
+  delete libraryAnalysisReports[fileId];
+  openLibraryReports.delete(fileId);
+  await loadLibraryFiles();
+  await loadProjects();
+}
+
+async function responseErrorMessage(response, fallback) {
+  const text = await response.text();
+  try {
+    const payload = JSON.parse(text);
+    const error = payload?.error || {};
+    const message = error.message || text.trim();
+    return `${fallback}: ${response.status}${message ? `\n${message}` : ""}`;
+  } catch (_error) {
+    // Fall through to stdlib HTML error parsing for older server responses.
+  }
+  const message = text.match(/<p>Message: ([\s\S]*?)\.<\/p>/)?.[1] || text.match(/<title>Error response<\/title>[\s\S]*?<p>Error code: \d+<\/p>[\s\S]*?<p>Message: ([\s\S]*?)<\/p>/)?.[1] || text.trim();
+  return `${fallback}: ${response.status}${message ? `\n${decodeHtmlEntities(message)}` : ""}`;
 }
 
 function renderProjectFileOptions() {
@@ -359,12 +419,13 @@ function renderProjects() {
         <strong>${escapeHtml(project.title || project.id)}</strong>
         <span>${escapeHtml(project.subject || "未设置学科方向")} · ${Number((project.library_file_ids || []).length)} 个资料引用</span>
         ${renderProjectStatus(project)}
+        ${renderProjectNextStep(project)}
         ${renderProjectJobStatus(project)}
       </div>
       <div class="resource-actions">
         <button type="button" data-project-edit="${escapeAttr(project.id)}">编辑配置</button>
         <button type="button" data-project-plan="${escapeAttr(project.id)}">生成编译计划</button>
-        <button type="button" data-project-compile="${escapeAttr(project.id)}"${!projectCanCompile(project) ? " disabled" : ""}>按确认方案编译</button>
+        <button type="button" data-project-compile="${escapeAttr(project.id)}"${!projectCanCompile(project) ? " disabled" : ""} title="${escapeAttr(projectCompileBlockReason(project))}">按确认方案编译</button>
       </div>
       ${renderProjectJobControlPanel(project)}
       ${renderProjectJobIntermediatePanel(project)}
@@ -401,6 +462,13 @@ function renderProjects() {
 function renderProjectStatus(project) {
   const state = project.status || "not_started";
   return `<span class="project-state"><span class="status-pill status-${escapeAttr(state)}">${escapeHtml(projectStatusLabel(state))}</span></span>`;
+}
+
+function renderProjectNextStep(project) {
+  const reason = projectCompileBlockReason(project);
+  const latest = (projectJobs[project.id] || [])[0];
+  const text = latest?.state === "waiting_review" ? "下一步：处理人工审核" : reason ? `下一步：${reason}` : "下一步：按确认方案编译";
+  return `<span class="project-next-step">${escapeHtml(text)}</span>`;
 }
 
 function renderProjectJobStatus(project) {
@@ -486,29 +554,43 @@ function renderJobIntermediatePanel(job, nodes = [], detail = null) {
         <button type="button" data-job-nodes-load="${escapeAttr(job.id)}">刷新节点结果</button>
       </div>
       ${job.state === "waiting_review" ? renderJobReviewPanel(job) : ""}
-      ${nodes.length ? `<div class="job-node-list">${nodeRows}</div>` : `<p class="muted">点击刷新节点结果查看 source brief、图片理解、课程计划、正文、Markdown 检查和质量检查。</p>`}
-      ${detail ? renderJobNodeDetail(detail) : ""}
+      <details class="technical-details">
+        <summary>技术详情</summary>
+        ${nodes.length ? `<div class="job-node-list">${nodeRows}</div>` : `<p class="muted">点击刷新节点结果查看 source brief、图片理解、课程计划、正文、Markdown 检查和质量检查。</p>`}
+        ${detail ? renderJobNodeDetail(detail) : ""}
+      </details>
     </div>
   `;
 }
 
 function renderJobReviewPanel(job) {
+  const summary = job.review_summary || {};
+  const failures = summary.failures || [];
+  const target = summary.default_target_node || "repair_course";
   return `
     <div class="job-review-panel">
       <strong>流程已阻塞在人工审核</strong>
-      <textarea data-review-feedback="${escapeAttr(job.id)}" rows="3" placeholder="填写修改意见，后续 agent 会读取这段反馈。"></textarea>
+      <p>${escapeHtml(summary.reason || job.error || "需要人工审核")}</p>
+      ${failures.length ? `<div class="review-failure-list">${failures.map((item) => `
+        <article>
+          <strong>${escapeHtml(item.lesson_id || "")} ${escapeHtml(item.lesson_title || "")}</strong>
+          <span>${escapeHtml(item.stage || "")} · ${escapeHtml(item.type || "")} · line ${Number(item.line || 0)}</span>
+          <p>${escapeHtml(item.message || "")}${item.block_id ? ` · ${escapeHtml(item.block_id)}` : ""}</p>
+        </article>
+      `).join("")}</div>` : `<p class="muted">未读取到结构化失败项，请打开技术详情查看 human_review.json。</p>`}
+      <p class="muted">${escapeHtml(summary.help_text || "通过表示允许系统继续自动修复；跳过可能导出仍有问题的课程。")}</p>
+      <textarea data-review-feedback="${escapeAttr(job.id)}" rows="3" placeholder="可选：填写修改意见，后续 agent 会读取这段反馈。"></textarea>
       <label>
         <span>目标节点</span>
         <select data-review-target="${escapeAttr(job.id)}">
-          ${compileNodeOptions(job.current_stage || "human_review")}
+          ${compileNodeOptions(target)}
         </select>
       </label>
       <div class="job-review-actions">
-        <button type="button" data-job-review="approve" data-job-id="${escapeAttr(job.id)}">通过</button>
-        <button type="button" data-job-review="request-modification" data-job-id="${escapeAttr(job.id)}">要求修改</button>
-        <button type="button" data-job-review="rerun" data-job-id="${escapeAttr(job.id)}">重跑</button>
-        <button type="button" data-job-review="rollback" data-job-id="${escapeAttr(job.id)}">回退</button>
-        <button type="button" data-job-review="skip" data-job-id="${escapeAttr(job.id)}">跳过</button>
+        <button type="button" data-job-review="approve" data-job-id="${escapeAttr(job.id)}">允许自动修复并继续</button>
+        <button type="button" data-job-review="request-modification" data-job-id="${escapeAttr(job.id)}">填写意见并重跑</button>
+        <button type="button" data-job-review="rollback" data-job-id="${escapeAttr(job.id)}">回退到规划</button>
+        <button type="button" data-job-review="skip" data-job-id="${escapeAttr(job.id)}">跳过审核并尝试导出</button>
         <button type="button" data-job-control="terminate" data-job-id="${escapeAttr(job.id)}">终止</button>
       </div>
     </div>
@@ -618,7 +700,7 @@ async function loadProjectJobNodes(jobId) {
 async function loadProjectJobNodeDetail(jobId, node) {
   const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/nodes/${encodeURIComponent(node)}`);
   if (!response.ok) {
-    window.alert(`读取节点详情失败: ${response.status}`);
+    window.alert(await responseErrorMessage(response, "读取节点详情失败"));
     return;
   }
   projectJobNodeDetails[jobId] = await response.json();
@@ -640,7 +722,7 @@ async function submitProjectJobReview(button) {
     body: JSON.stringify({ feedback, target_node: targetNode }),
   });
   if (!response.ok) {
-    window.alert(`提交审核操作失败: ${response.status}`);
+    window.alert(await responseErrorMessage(response, "提交审核操作失败"));
     return;
   }
   projectJobNodes[jobId] = [];
@@ -649,7 +731,7 @@ async function submitProjectJobReview(button) {
 }
 
 function projectHasRunningJob(projectId) {
-  return (projectJobs[projectId] || []).some((job) => ["queued", "running", "paused", "terminating"].includes(job.state));
+  return (projectJobs[projectId] || []).some((job) => ["queued", "running", "paused", "terminating", "waiting_review"].includes(job.state));
 }
 
 function projectSourcesReady(project) {
@@ -665,6 +747,25 @@ function projectSourcesReady(project) {
 
 function projectCanCompile(project) {
   return Boolean(project?.confirmed_compile_snapshot?.plan_id) && projectSourcesReady(project) && !projectHasRunningJob(project.id);
+}
+
+function projectCompileBlockReason(project) {
+  const ids = project?.library_file_ids || [];
+  if (!ids.length) {
+    return "先选择资料并保存课程项目";
+  }
+  const blockedSources = ids.map((id) => libraryFiles.find((item) => item.id === id) || { id }).filter((file) => !Boolean(file?.can_compile || (file?.parse_status === "parsed" && file?.parsed_source_path)));
+  if (blockedSources.length) {
+    return `等待资料解析完成：${blockedSources.map((file) => file.filename || file.id).join(", ")}`;
+  }
+  if (!project?.confirmed_compile_snapshot?.plan_id) {
+    return "生成并确认编译计划";
+  }
+  const latest = (projectJobs[project.id] || [])[0];
+  if (latest && ["queued", "running", "paused", "terminating", "waiting_review"].includes(latest.state)) {
+    return latest.state === "waiting_review" ? "处理人工审核" : "等待当前编译任务结束";
+  }
+  return "";
 }
 
 function renderProjectPreflightPanel(project) {
@@ -739,7 +840,7 @@ async function generateProjectPreflight(projectId) {
     body: JSON.stringify({}),
   });
   if (!response.ok) {
-    window.alert(`生成计划失败: ${response.status}`);
+    window.alert(await responseErrorMessage(response, "生成计划失败"));
     return;
   }
   const data = await response.json();
@@ -761,9 +862,10 @@ async function confirmProjectPlan(projectId) {
     body: JSON.stringify({ plan_id: plan.id, selected_scheme_id: selected }),
   });
   if (!response.ok) {
-    window.alert(`确认计划失败: ${response.status}`);
+    window.alert(await responseErrorMessage(response, "确认计划失败"));
     return;
   }
+  await loadLibraryFiles();
   await loadProjects();
 }
 
@@ -780,7 +882,7 @@ async function startProjectCompile(projectId) {
     body: JSON.stringify({ plan_id: planId }),
   });
   if (!response.ok) {
-    window.alert(`启动编译失败: ${response.status}`);
+    window.alert(await responseErrorMessage(response, "启动编译失败"));
     return;
   }
   await loadProjects();
@@ -807,7 +909,7 @@ function scheduleLibraryPolling() {
     window.clearTimeout(libraryPollTimer);
     libraryPollTimer = 0;
   }
-  const hasParsing = libraryFiles.some((file) => ["waiting_parse", "parsing"].includes(file.parse_status || file.analysis_status));
+  const hasParsing = libraryFiles.some((file) => isActiveParse(file));
   if (!hasParsing) {
     return;
   }
@@ -1809,6 +1911,16 @@ function escapeAttr(value) {
   return escapeHtml(value);
 }
 
+function decodeHtmlEntities(value) {
+  return String(value).replace(/&(amp|lt|gt|quot|#39);/g, (entity, name) => ({
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: "\"",
+    "#39": "'",
+  }[name] || entity));
+}
+
 function sanitizeImageUrl(value) {
   if (!value) {
     return "";
@@ -1863,12 +1975,14 @@ if (typeof module !== "undefined") {
     parseStatusLabel,
     parseProgressValue,
     parseStageLabel,
+    projectCompileBlockReason,
     preprocessMarkdown,
     parseReadingKey,
     projectStatusLabel,
     readingKey,
     renderAnalysisReport,
     renderLibraryFileItem,
+    renderJobReviewPanel,
     renderJobIntermediatePanel,
     renderJobNodeDetail,
     renderProjectJobStatus,

@@ -24,6 +24,11 @@ from urllib.parse import quote, unquote
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIR = ROOT / "frontend"
 VAULT_ROOT = ROOT / "course-vault"
+PARSE_STALE_SECONDS = int(os.environ.get("PAPERCOURSE_PARSE_STALE_SECONDS", "7500"))
+
+
+class ConflictError(ValueError):
+    """Raised when an API mutation is valid but blocked by current repository state."""
 
 
 class CourseRequestHandler(SimpleHTTPRequestHandler):
@@ -64,6 +69,8 @@ class CourseRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json({"files": list_library_files(VAULT_ROOT)})
             elif method == "POST" and parts == ["api", "library", "upload"]:
                 self._send_json({"files": self._handle_library_upload()})
+            elif method == "DELETE" and len(parts) == 4 and parts[:3] == ["api", "library", "files"]:
+                self._send_json(delete_library_file(VAULT_ROOT, parts[3]))
             elif method == "GET" and len(parts) == 5 and parts[:3] == ["api", "library", "files"] and parts[4] == "analysis":
                 self._send_json(read_library_analysis(VAULT_ROOT, parts[3]))
             elif method == "GET" and len(parts) == 5 and parts[:3] == ["api", "library", "files"] and parts[4] == "parse":
@@ -122,14 +129,25 @@ class CourseRequestHandler(SimpleHTTPRequestHandler):
                 self._send_json(delete_lesson_entry(VAULT_ROOT, parts[2], parts[4], parts[5]))
             else:
                 self.send_error(404, "Unknown API route")
-        except FileNotFoundError:
-            self.send_error(404, "Course data not found")
+        except FileNotFoundError as exc:
+            self._send_error_json(404, "not_found", "Course data not found", {"detail": str(exc)})
+        except ConflictError as exc:
+            self._send_error_json(409, "conflict", str(exc))
         except ValueError as exc:
-            self.send_error(400, str(exc))
+            self._send_error_json(400, "bad_request", str(exc))
 
     def _send_json(self, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error_json(self, status: int, code: str, message: str, details: object | None = None) -> None:
+        payload = {"error": {"code": code, "message": message, "details": details or {}}}
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -259,7 +277,11 @@ def store_library_upload(vault_root: Path, filename: str, stream, *, run_async: 
 def list_library_files(vault_root: Path = VAULT_ROOT) -> list[dict[str, object]]:
     index = _read_json_if_exists(vault_root / "library" / "library_index.json", {"files": []})
     files = index.get("files", []) if isinstance(index, dict) else []
-    normalized = [_with_parse_job_summary(vault_root, _with_legacy_parse_defaults(vault_root, dict(item))) for item in files if isinstance(item, dict)]
+    normalized = [
+        _with_library_usage_summary(vault_root, _with_parse_job_summary(vault_root, _with_legacy_parse_defaults(vault_root, dict(item))))
+        for item in files
+        if isinstance(item, dict)
+    ]
     return sorted(normalized, key=lambda item: str(item.get("uploaded_at", "")), reverse=True)
 
 
@@ -270,6 +292,96 @@ def read_library_analysis(vault_root: Path, file_id: str) -> dict[str, object]:
     return _read_json(path)
 
 
+def library_file_usage(vault_root: Path, file_id: str) -> dict[str, list[dict[str, object]]]:
+    record = _library_record_by_id(vault_root, file_id)
+    return _library_file_usage_for_record(vault_root, record)
+
+
+def _library_file_usage_for_record(vault_root: Path, record: dict[str, object]) -> dict[str, list[dict[str, object]]]:
+    file_id = str(record.get("id") or "")
+    projects = [
+        {
+            "id": project.get("id", ""),
+            "title": project.get("title", project.get("id", "")),
+            "status": project.get("status", ""),
+        }
+        for project in list_course_projects(vault_root)
+        if str(file_id) in {str(item) for item in project.get("library_file_ids", [])}
+    ]
+    courses = []
+    courses_dir = vault_root / "courses"
+    if courses_dir.exists():
+        for course_dir in sorted(item for item in courses_dir.iterdir() if item.is_dir()):
+            meta = _read_json_if_exists(course_dir / "course_meta.json", {"course_id": course_dir.name})
+            matched_sources = [
+                str(source)
+                for source in meta.get("source_files", [])
+                if _source_matches_library_record(vault_root, str(source), record)
+            ]
+            if matched_sources:
+                courses.append(
+                    {
+                        "id": meta.get("course_id", course_dir.name),
+                        "title": _course_title(course_dir.name, meta),
+                        "sources": matched_sources,
+                    }
+                )
+    return {"projects": projects, "courses": courses}
+
+
+def _with_library_usage_summary(vault_root: Path, record: dict[str, object]) -> dict[str, object]:
+    usage = _library_file_usage_for_record(vault_root, record)
+    status = str(record.get("parse_status") or record.get("analysis_status") or "")
+    active_parse = status in {"waiting_parse", "parsing"} and not bool(record.get("parse_is_stale"))
+    blocked = []
+    if active_parse:
+        blocked.append("资料仍在解析中，请等待解析结束后再删除")
+    if usage["projects"] or usage["courses"]:
+        names = [str(item.get("title") or item.get("id")) for item in usage["projects"] + usage["courses"]]
+        blocked.append(f"资料仍被课程或课程项目使用: {', '.join(names)}")
+    return {
+        **record,
+        "usage": usage,
+        "can_delete": not blocked,
+        "delete_block_reason": "；".join(blocked),
+    }
+
+
+def delete_library_file(vault_root: Path, file_id: str) -> dict[str, object]:
+    record = _with_parse_job_summary(vault_root, _library_record_by_id(vault_root, file_id))
+    status = str(record.get("parse_status") or record.get("analysis_status") or "")
+    if status in {"waiting_parse", "parsing"} and not bool(record.get("parse_is_stale")):
+        raise ConflictError("资料仍在解析中，请等待解析结束后再删除")
+    usage = library_file_usage(vault_root, file_id)
+    if usage["projects"] or usage["courses"]:
+        names = [str(item.get("title") or item.get("id")) for item in usage["projects"] + usage["courses"]]
+        raise ConflictError(f"资料仍被课程或课程项目使用，不能删除: {', '.join(names)}")
+
+    _remove_library_record(vault_root, file_id)
+    source_path = (vault_root / str(record.get("path", ""))).resolve()
+    source_root = (vault_root / "library" / "files").resolve()
+    source_dir = (source_root / _safe_filename(file_id)).resolve()
+    if source_dir.exists() and source_dir.is_relative_to(source_root):
+        shutil.rmtree(source_dir)
+    elif source_path.exists() and source_path.is_relative_to(source_root):
+        source_path.unlink()
+    analysis_path = _library_analysis_path(vault_root, file_id)
+    if analysis_path.exists():
+        analysis_path.unlink()
+    parsed_dir = _parsed_library_dir(vault_root, file_id)
+    parsed_root = (vault_root / "parsed" / "library").resolve()
+    if parsed_dir.exists() and parsed_dir.resolve().is_relative_to(parsed_root):
+        shutil.rmtree(parsed_dir)
+    task_id = str(record.get("parse_task_id") or "")
+    if task_id:
+        parse_dir = _parse_job_dir(vault_root, task_id)
+        parse_root = (vault_root / "parse-jobs").resolve()
+        if parse_dir.exists() and parse_dir.resolve().is_relative_to(parse_root):
+            shutil.rmtree(parse_dir)
+    _server_log("library file deleted", file_id=file_id, filename=record.get("filename", ""))
+    return {"deleted": True, "file_id": file_id}
+
+
 def read_library_parse_status(vault_root: Path, file_id: str) -> dict[str, object]:
     file_record = _with_parse_job_summary(vault_root, _library_record_by_id(vault_root, file_id))
     task_id = str(file_record.get("parse_task_id") or "")
@@ -278,7 +390,10 @@ def read_library_parse_status(vault_root: Path, file_id: str) -> dict[str, objec
 
 
 def start_library_parse_task(vault_root: Path, file_id: str, *, run_async: bool = False) -> dict[str, object]:
-    record = _library_record_by_id(vault_root, file_id)
+    record = _with_parse_job_summary(vault_root, _library_record_by_id(vault_root, file_id))
+    status = str(record.get("parse_status") or record.get("analysis_status") or "")
+    if record.get("parse_task_id") and status in {"waiting_parse", "parsing"} and not bool(record.get("parse_is_stale")):
+        raise ConflictError("资料仍在解析中，请等待解析结束后再重新解析")
     task_id = f"parse-{_safe_filename(file_id)}-{uuid.uuid4().hex[:10]}"
     now = _mtime_iso_from(time.time())
     job = {
@@ -316,6 +431,7 @@ def read_parse_job_status(vault_root: Path, task_id: str) -> dict[str, object]:
         raise FileNotFoundError(task_id)
     job = _read_json(path)
     events = _read_job_events(job_dir)
+    job = _reconcile_parse_job(vault_root, job_dir, job, events)
     return {**_parse_job_with_event_progress(job, events), "events": events[-80:]}
 
 
@@ -334,13 +450,62 @@ def _with_parse_job_summary(vault_root: Path, record: dict[str, object]) -> dict
                 "parse_error": job.get("error", ""),
                 "parse_started_at": job.get("started_at", ""),
                 "parse_finished_at": job.get("finished_at", ""),
+                "parse_last_event_at": job.get("last_event_at", ""),
+                "parse_is_stale": bool(job.get("parse_is_stale")),
             }
+            if job.get("state") in {"parsed", "parse_failed"}:
+                record["parse_status"] = job["state"]
+                record["analysis_status"] = "failed" if job["state"] == "parse_failed" else record.get("analysis_status", "success")
     status = str(record.get("parse_status") or record.get("analysis_status") or "")
     record["can_compile"] = status == "parsed" and bool(record.get("parsed_source_path"))
     record.setdefault("parse_progress", 100 if status in {"parsed", "parse_failed"} else 0)
     record.setdefault("parse_current_stage", status)
     record.setdefault("parse_error", "")
+    record.setdefault("parse_last_event_at", "")
+    record.setdefault("parse_is_stale", False)
     return record
+
+
+def _reconcile_parse_job(vault_root: Path, job_dir: Path, job: dict[str, object], events: list[dict[str, object]]) -> dict[str, object]:
+    state = str(job.get("state", ""))
+    if state not in {"waiting_parse", "parsing"}:
+        return job
+    last_event = events[-1] if events else {}
+    last_time = _parse_iso_timestamp(str(last_event.get("timestamp") or job.get("updated_at") or job.get("started_at") or ""))
+    job["last_event_at"] = _mtime_iso_from(last_time) if last_time else ""
+    stale = bool(last_time and time.time() - last_time > PARSE_STALE_SECONDS)
+    job["parse_is_stale"] = stale
+    if not stale:
+        return job
+
+    file_id = str(job.get("file_id") or "")
+    message = "解析任务超时或服务中断，请重新解析"
+    now = _mtime_iso_from(time.time())
+    job.update({"state": "parse_failed", "current_stage": "parse_failed", "progress": 100, "error": message, "finished_at": now, "updated_at": now, "parse_is_stale": True})
+    _write_json(job_dir / "job.json", job)
+    _append_job_event(job_dir, {"stage": "parse", "status": "parse_failed", "error": message})
+    try:
+        record = _library_record_by_id_raw(vault_root, file_id)
+        source_path = (vault_root / str(record.get("path", ""))).resolve()
+        report = _failed_analysis_report(record, source_path, message)
+        _write_json(_library_analysis_path(vault_root, file_id), report)
+        record.update({"parse_status": "parse_failed", "analysis_status": "failed", "analysis_report_path": str(Path("library") / "analysis" / f"{file_id}.json"), "updated_at": now})
+        _upsert_library_record(vault_root, record)
+    except FileNotFoundError:
+        pass
+    _server_log("parse task marked stale", file_id=file_id, task_id=job.get("id", ""), error=message)
+    return job
+
+
+def _parse_iso_timestamp(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _parse_job_with_event_progress(job: dict[str, object], events: list[dict[str, object]]) -> dict[str, object]:
@@ -1301,6 +1466,7 @@ def _refresh_job_review_state(vault_root: Path, job: dict[str, object]) -> dict[
         job["current_stage"] = "human_review"
         job["progress"] = max(int(job.get("progress") or 0), _job_progress_from_events(_job_dir(vault_root, str(job["id"]))))
         job["review"] = _read_json_if_exists(review_path, {})
+        job["review_summary"] = _human_review_summary(job.get("review", {}), job.get("error", ""))
         job["updated_at"] = _mtime_iso_from(time.time())
     return job
 
@@ -1344,7 +1510,53 @@ def _build_job_node_result(job_dir: Path, course_path: Path, node: str, events: 
     if node == "human_review":
         result["review"] = _read_json_if_exists(course_path / "human_review.json", {})
         result["review_decisions"] = _read_review_decisions(job_dir)
+        result["review_summary"] = _human_review_summary(result["review"], str(job.get("error", "")))
     return result
+
+
+def _human_review_summary(review: object, job_error: str = "") -> dict[str, object]:
+    review_dict = review if isinstance(review, dict) else {}
+    validation = review_dict.get("validation_report", {}) if isinstance(review_dict.get("validation_report"), dict) else {}
+    failures = validation.get("failures", []) if isinstance(validation, dict) else []
+    if not failures and isinstance(validation.get("layers"), dict):
+        for layer in validation["layers"].values():
+            if isinstance(layer, dict) and isinstance(layer.get("failures"), list):
+                failures.extend(layer["failures"])
+    items = []
+    for failure in failures[:12]:
+        if not isinstance(failure, dict):
+            continue
+        items.append(
+            {
+                "stage": failure.get("stage", ""),
+                "type": failure.get("type", ""),
+                "lesson_id": failure.get("lesson_id", ""),
+                "lesson_title": failure.get("lesson_title", ""),
+                "block_id": failure.get("block_id", ""),
+                "line": failure.get("line"),
+                "message": failure.get("message") or failure.get("reason") or "",
+            }
+        )
+    target = _review_default_target(items)
+    return {
+        "reason": review_dict.get("reason", "") or job_error or "需要人工审核",
+        "failure_count": len(failures),
+        "failures": items,
+        "recommended_action": "approve",
+        "recommended_action_label": "允许自动修复并继续",
+        "default_target_node": target,
+        "help_text": "通过表示允许系统从推荐节点继续自动修复；跳过会尝试导出可能仍有问题的课程。",
+    }
+
+
+def _review_default_target(failures: list[dict[str, object]]) -> str:
+    types = {str(item.get("type") or "") for item in failures}
+    stages = {str(item.get("stage") or "") for item in failures}
+    if any(item in types for item in {"broken_formula", "source_quote_untraceable", "missing_source_citation"}):
+        return "repair_course"
+    if "markdown_syntax" in stages:
+        return "check_markdown_syntax"
+    return "repair_course"
 
 
 def _node_status(node: str, node_events: list[dict[str, object]], job: dict[str, object]) -> str:
@@ -1503,6 +1715,7 @@ def _job_response(job: dict[str, object]) -> dict[str, object]:
         "pid": job.get("pid", 0),
         "rerun": job.get("rerun", {}),
         "review": job.get("review", {}),
+        "review_summary": job.get("review_summary", _human_review_summary(job.get("review", {}), str(job.get("error", ""))) if job.get("review") else {}),
         "status_url": f"/api/jobs/{job['id']}",
         "created_at": job.get("created_at", ""),
         "updated_at": job.get("updated_at", ""),
@@ -1836,6 +2049,15 @@ def _library_record_by_id(vault_root: Path, file_id: str) -> dict[str, object]:
     raise FileNotFoundError(file_id)
 
 
+def _library_record_by_id_raw(vault_root: Path, file_id: str) -> dict[str, object]:
+    index = _read_json_if_exists(vault_root / "library" / "library_index.json", {"files": []})
+    files = index.get("files", []) if isinstance(index, dict) else []
+    for record in files:
+        if isinstance(record, dict) and str(record.get("id")) == str(file_id):
+            return dict(record)
+    raise FileNotFoundError(file_id)
+
+
 def _requires_mineru(path: Path) -> bool:
     return path.suffix.lower() in PARSER_REQUIRED_SUFFIXES
 
@@ -1922,6 +2144,45 @@ def _upsert_library_record(vault_root: Path, record: dict[str, object]) -> None:
     files = [item for item in index.get("files", []) if isinstance(item, dict) and item.get("id") != record.get("id")] if isinstance(index, dict) else []
     files.append(record)
     _write_json(index_path, {"files": files})
+
+
+def _remove_library_record(vault_root: Path, file_id: str) -> None:
+    index_path = vault_root / "library" / "library_index.json"
+    index = _read_json_if_exists(index_path, {"files": []})
+    files = [item for item in index.get("files", []) if isinstance(item, dict) and str(item.get("id")) != str(file_id)] if isinstance(index, dict) else []
+    _write_json(index_path, {"files": files})
+
+
+def _source_matches_library_record(vault_root: Path, source: str, record: dict[str, object]) -> bool:
+    if not source:
+        return False
+    file_id = str(record.get("id") or "")
+    normalized = source.replace("\\", "/")
+    path_values = [str(record.get("path") or ""), str(record.get("parsed_source_path") or "")]
+    path_values = [item.replace("\\", "/") for item in path_values if item]
+    if normalized in path_values or any(normalized.endswith(item) for item in path_values):
+        return True
+    if file_id and f"/{file_id}/" in f"/{normalized}/":
+        return True
+
+    candidates = []
+    for raw in path_values:
+        path = Path(raw)
+        candidates.append(path if path.is_absolute() else (vault_root / path))
+    candidates.extend([vault_root / "library" / "files" / file_id, _parsed_library_dir(vault_root, file_id)])
+    try:
+        source_path = Path(source)
+        resolved_source = source_path.resolve() if source_path.is_absolute() else (vault_root / source_path).resolve()
+    except OSError:
+        return False
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved_source == resolved or resolved_source.is_relative_to(resolved):
+            return True
+    return False
 
 
 def _safe_filename(value: str) -> str:
